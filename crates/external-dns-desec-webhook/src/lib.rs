@@ -113,6 +113,7 @@
 //! detail was verified, `docs/rate-limits.md` works through the request budget, and
 //! `docs/deployment.md` has the full manifests.
 
+pub mod adjust;
 pub mod config;
 pub mod convert;
 pub mod error;
