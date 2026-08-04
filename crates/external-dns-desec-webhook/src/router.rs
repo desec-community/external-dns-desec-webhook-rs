@@ -93,9 +93,10 @@ async fn records(
     let started = Instant::now();
     let snapshot = state.store.load();
 
-    // An empty array here is not "nothing to do": under `--policy=sync` external-dns reads
-    // it as "delete every record you own". So a snapshot we never managed to load is a 503,
-    // which external-dns retries, rather than an answer.
+    // An empty array is not "nothing to do", it is a claim that the zone is empty. Every row
+    // then takes the `len(row.current) == 0` branch of `plan.calculateChanges`, so external-dns
+    // plans a Create for every endpoint it knows about, and the TXT registry re-plans ownership
+    // for all of them. A 503 is retried; an empty answer is believed.
     if !snapshot.is_populated() {
         state
             .metrics

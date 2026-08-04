@@ -178,9 +178,11 @@ pub fn fqdn_of(subname: &Subname, zone: &str) -> String {
 
 /// Whether an RRset is deSEC's to manage rather than external-dns's.
 ///
-/// Reporting these would be actively harmful: under `--policy=sync` external-dns tries to
-/// delete every record in a managed zone that its registry does not claim, so an apex
-/// `SOA` or `NS` becomes a delete that deSEC rejects, every cycle, forever.
+/// Reporting them would be actively harmful. They are not ours to write -- deSEC rejects any
+/// attempt -- so every plan that touches one produces a request that can only ever fail. Under
+/// `--registry=txt` a delete is filtered out by owner ID, but under `--registry=noop` that
+/// filter is skipped entirely and an apex `SOA` or `NS` becomes a delete deSEC rejects, every
+/// cycle, forever.
 ///
 /// Scoped to the apex on purpose. `DS` at a *subname* is an ordinary delegation record
 /// that an operator may well want external-dns to manage, even though `DS` at the apex

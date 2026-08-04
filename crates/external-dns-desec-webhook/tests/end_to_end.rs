@@ -127,8 +127,8 @@ async fn records_are_reported_without_a_trailing_dot() {
     assert_eq!(alias["targets"], json!(["target.example.org"]));
 }
 
-/// An empty array is not "nothing to do": under `--policy=sync` external-dns reads it as
-/// "delete every record you own". A 503 is retried; an empty answer is acted on.
+/// An empty array is not "nothing to do", it is a claim the zone is empty, and external-dns
+/// plans a Create for every endpoint it knows about. A 503 is retried; a claim is believed.
 #[tokio::test]
 async fn records_answers_503_rather_than_an_empty_array_when_no_zone_is_managed() {
     // A configured zone the account does not hold.

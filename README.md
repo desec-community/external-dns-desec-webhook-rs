@@ -76,8 +76,10 @@ it owns.
 Binding them to `0.0.0.0` grants DNS write access to every pod that can reach the
 port; the webhook warns at startup if you do.
 
-**A domain filter is mandatory.** Under `--policy=sync` external-dns deletes records
-it does not recognise in any zone it believes it manages. There is deliberately no
+**A domain filter is mandatory.** With `--registry=txt` external-dns filters deletions by
+owner ID, so a zone it has never written to is safe — but `--registry=noop` reports an
+empty owner ID and that filter is skipped entirely, at which point every record in a zone
+we report that the source does not produce becomes a deletion. There is deliberately no
 "manage the whole account" mode.
 
 **`--webhook-provider-read-timeout=30s` should no longer be needed.** It was a

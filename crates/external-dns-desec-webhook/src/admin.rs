@@ -39,7 +39,7 @@ pub struct AdminState {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Readiness {
     /// Nothing has been loaded from deSEC yet. `/records` answers 503 in this state, rather
-    /// than reporting an empty record set that `--policy=sync` would act on.
+    /// than claiming the zones are empty.
     NoSnapshot,
     Fresh {
         age: Duration,

@@ -44,9 +44,9 @@ pub struct RefreshUpdate {
 
     /// Whether the zone list itself was read successfully.
     ///
-    /// When it was not, no zone is removed. A throttled or failed list is not evidence
-    /// that a zone has gone away, and acting as if it were would empty the snapshot and
-    /// ask external-dns to delete everything.
+    /// When it was not, no zone is removed. A throttled or failed list is not evidence that a
+    /// zone has gone away, and acting as if it were would empty the snapshot and have
+    /// external-dns replan every record from scratch.
     pub zone_list_ok: bool,
 
     pub error: Option<String>,
@@ -101,10 +101,10 @@ impl SnapshotStore {
     /// Publish a refresh result.
     ///
     /// A zone is published only once we have actually read its records. A zone the account
-    /// holds but that we have never listed is left out entirely rather than published
-    /// empty, because an empty zone reported to external-dns under `--policy=sync` reads
-    /// as "delete every record here". Until it is listed, names in it resolve to nothing
-    /// and are skipped with a warning, which is the safe direction to be wrong in.
+    /// holds but that we have never listed is left out entirely rather than published empty,
+    /// because publishing it empty would claim it has no records. Until it is listed, names in
+    /// it resolve to nothing and are skipped with a warning, which is the safe direction to be
+    /// wrong in.
     pub async fn publish(&self, update: RefreshUpdate) -> PublishReport {
         self.update(|current| {
             let mut report = PublishReport::default();
@@ -369,7 +369,7 @@ mod tests {
             .await;
 
         let snapshot = store.load();
-        // Publishing new.example.com as empty would read as "delete everything in it".
+        // Publishing new.example.com as empty would claim it holds no records.
         assert!(snapshot.zones.get("new.example.com").is_none());
         assert!(snapshot.zones.get("listed.example.com").is_some());
     }
@@ -572,9 +572,8 @@ mod tests {
         assert!(store.load().zones.get("b.example.com").is_none());
     }
 
-    /// A throttled or failed zone list is not evidence that a zone has gone away. Treating
-    /// it as such would empty the snapshot, and an empty snapshot under --policy=sync is a
-    /// request to delete everything.
+    /// A throttled or failed zone list is not evidence that a zone has gone away. Treating it
+    /// as such would empty the snapshot, which claims the zones hold nothing.
     #[tokio::test]
     async fn a_failed_zone_list_removes_nothing_and_keeps_the_snapshot_servable() {
         let store = SnapshotStore::new();

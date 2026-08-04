@@ -75,9 +75,10 @@ pub struct Config {
 
     /// Serve an empty record set when no configured zone exists in the account.
     ///
-    /// Off by default, because under `--policy=sync` an empty `/records` reply means
-    /// "delete every record you own". Answering 503 instead keeps external-dns waiting
-    /// rather than reconciling against a zone list we failed to load.
+    /// Off by default, because an empty reply is not "nothing to do" but a claim that the
+    /// zones are empty, and external-dns plans a Create for every endpoint it knows about.
+    /// Answering 503 keeps it waiting rather than reconciling against a zone list we failed
+    /// to load.
     #[arg(long, env = "WEBHOOK_ALLOW_EMPTY_ZONE_SET")]
     pub allow_empty_zone_set: bool,
 
@@ -165,9 +166,14 @@ impl Config {
 
     /// The zones we are willing to manage, normalized.
     ///
-    /// Required, with no "manage everything" mode. external-dns under `--policy=sync`
-    /// deletes any record in a managed zone it does not recognise, so an unfiltered
-    /// webhook over a whole deSEC account is one misconfiguration away from erasing DNS
+    /// Required, with no "manage everything" mode.
+    ///
+    /// Under `--registry=txt` external-dns filters deletions by owner ID
+    /// (`plan.calculateChanges` calls `FilterEndpointsByOwnerID` when `OwnerID != ""`), so a
+    /// zone it has never written to is safe. But `NoopRegistry::OwnerID` returns `""`, and
+    /// that filter is then skipped entirely: with `--registry=noop --policy=sync`, every
+    /// record in a zone we report that the source does not produce becomes a Delete. An
+    /// unfiltered webhook over a whole deSEC account is one such flag away from erasing DNS
     /// the cluster never knew about.
     pub fn zones(&self) -> Result<Vec<String>, ConfigError> {
         let zones = normalize_names(&self.domain_filter);

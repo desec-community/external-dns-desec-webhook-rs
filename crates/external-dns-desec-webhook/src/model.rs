@@ -107,8 +107,9 @@ impl Zone {
     /// A zone we know exists but have not listed yet.
     ///
     /// `touched: None` so the first refresh always lists it. It is deliberately not
-    /// published to a snapshot in this state: an empty zone reported to external-dns
-    /// under `--policy=sync` reads as "delete everything here".
+    /// published to a snapshot in this state: a zone reported with no records is a claim that
+    /// it has none, and external-dns then plans a Create for every endpoint it believes
+    /// belongs there.
     pub fn unlisted(domain: &Domain) -> Self {
         Self {
             name: domain.name.to_ascii_lowercase(),
@@ -232,9 +233,9 @@ pub struct Snapshot {
 impl Snapshot {
     /// Whether the snapshot can be served at all.
     ///
-    /// Distinct from freshness. An old snapshot is fine; one that was never populated is
-    /// not, because reporting no records to external-dns under `--policy=sync` asks it to
-    /// delete every record it owns.
+    /// Distinct from freshness. An old snapshot is fine; one that was never populated is not,
+    /// because reporting no records claims the zones are empty rather than admitting we do not
+    /// know, and external-dns plans against the claim.
     pub fn is_populated(&self) -> bool {
         self.last_full_ok.is_some()
     }

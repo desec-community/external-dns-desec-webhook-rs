@@ -408,10 +408,13 @@ mod tests {
         server.verify().await;
     }
 
-    /// The test that most distinguishes this provider from the one it replaces. With the
-    /// desec crate's defaults -- three retries honouring a `Retry-After: 120` -- this same
-    /// call sleeps about six minutes, and external-dns dies on its 15-second budget long
-    /// before it returns.
+    /// The test that most distinguishes this provider from the one it replaces.
+    ///
+    /// `Retry-After: 30` is chosen deliberately. The crate's default `max_retry_delay` is 60s,
+    /// and its 429 branch gives up immediately when the server's delay exceeds it — so a
+    /// `Retry-After` of 120 would *not* demonstrate anything. Thirty seconds is inside the
+    /// window, so with `max_retries: 3` the call would sleep 30s three times: about 90
+    /// seconds, against a client budget of 15.
     ///
     /// Timed against the wall clock rather than under `start_paused`: tokio auto-advances
     /// paused time whenever every task is idle, and a task awaiting a real socket looks
@@ -422,7 +425,7 @@ mod tests {
         Mock::given(method("PATCH"))
             .respond_with(
                 ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "120")
+                    .insert_header("Retry-After", "30")
                     .set_body_json(serde_json::json!({"detail": "Request was throttled."})),
             )
             .mount(&server)
@@ -444,7 +447,7 @@ mod tests {
         assert_eq!(error.status().as_u16(), 503, "never 429: that is permanent");
         assert_eq!(
             error.retry_after(),
-            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(30)),
             "deSEC's own Retry-After is passed on"
         );
         assert!(
