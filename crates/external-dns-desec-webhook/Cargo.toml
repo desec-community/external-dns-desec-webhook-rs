@@ -1,0 +1,66 @@
+[package]
+name = "external-dns-desec-webhook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "external-dns webhook provider for deSEC DNS"
+readme = "../../README.md"
+keywords = ["dns", "desec", "kubernetes", "external-dns"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lints]
+workspace = true
+
+[lib]
+name = "external_dns_desec_webhook"
+path = "src/lib.rs"
+
+[[bin]]
+name = "external-dns-desec-webhook"
+path = "src/main.rs"
+
+# No TLS feature. Feature flags are a library's compatibility tool; for a binary they
+# would ship one configuration and test another. The TLS backend is fixed here.
+[dependencies]
+arc-swap = "1.9.2"
+axum = { version = "0.8.9", default-features = false, features = [
+  "http1",
+  "tokio",
+] }
+chrono = { version = "0.4.45", default-features = false, features = [
+  "clock",
+  "serde",
+  "std",
+] }
+clap = { version = "4.6.5", features = ["derive", "env"] }
+desec = { version = "0.0.1", default-features = false, features = [
+  "rustls-tls",
+] }
+futures-util = { version = "0.3.33", default-features = false, features = [
+  "std",
+] }
+humantime = "2.3.0"
+prometheus-client = "0.25.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tower = { version = "0.5.3", features = ["timeout"] }
+tower-http = { version = "0.7.0", features = ["timeout", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1.9.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+tokio = { version = "1.53.1", features = ["test-util"] }
+wiremock = "0.6.5"
