@@ -118,6 +118,7 @@ pub mod config;
 pub mod convert;
 pub mod error;
 pub mod model;
+pub mod plan;
 pub mod wire;
 
 pub use config::Config;
