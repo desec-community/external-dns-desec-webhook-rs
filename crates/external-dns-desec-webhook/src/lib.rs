@@ -114,5 +114,7 @@
 //! `docs/deployment.md` has the full manifests.
 
 pub mod config;
+pub mod error;
+pub mod wire;
 
 pub use config::Config;
