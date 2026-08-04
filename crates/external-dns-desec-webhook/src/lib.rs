@@ -114,12 +114,16 @@
 //! `docs/deployment.md` has the full manifests.
 
 pub mod adjust;
+pub mod admin;
 pub mod apply;
 pub mod config;
 pub mod convert;
 pub mod error;
+pub mod metrics;
 pub mod model;
 pub mod plan;
+pub mod refresh;
+pub mod router;
 pub mod store;
 pub mod wire;
 

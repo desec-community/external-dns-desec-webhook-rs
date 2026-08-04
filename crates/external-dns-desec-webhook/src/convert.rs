@@ -206,27 +206,47 @@ pub fn canonical_rdata(record_type: &RecordType, value: &str) -> String {
     map_rdata_name(record_type, value, canonical_name)
 }
 
-/// A deSEC RRset as the endpoint external-dns expects to see.
-pub fn endpoint_from_rrset(zone: &str, rrset: &Rrset) -> Endpoint {
-    let targets = rrset
-        .records
+/// A stored RRset as the endpoint external-dns expects to see.
+///
+/// Takes the parts rather than an [`Rrset`] because that is what the snapshot holds, and
+/// because `Rrset` is `#[non_exhaustive]` with no constructor — it can only be deserialized
+/// from a response, which is the wrong shape for a cache.
+pub fn endpoint_from_parts(
+    zone: &str,
+    subname: &Subname,
+    record_type: &RecordType,
+    records: &[String],
+    ttl: u32,
+) -> Endpoint {
+    let targets = records
         .iter()
         .map(|record| {
-            if is_text_type(&rrset.record_type) {
+            if is_text_type(record_type) {
                 txt_unquote(record)
             } else {
-                canonical_rdata(&rrset.record_type, record)
+                canonical_rdata(record_type, record)
             }
         })
         .collect();
 
     Endpoint {
-        dns_name: fqdn_of(&rrset.subname, zone),
+        dns_name: fqdn_of(subname, zone),
         targets,
-        record_type: RecordTypeName::new(rrset.record_type.as_str()),
-        record_ttl: Ttl(i64::from(rrset.ttl)),
+        record_type: RecordTypeName::new(record_type.as_str()),
+        record_ttl: Ttl(i64::from(ttl)),
         ..Endpoint::default()
     }
+}
+
+/// The same, straight off the wire.
+pub fn endpoint_from_rrset(zone: &str, rrset: &Rrset) -> Endpoint {
+    endpoint_from_parts(
+        zone,
+        &rrset.subname,
+        &rrset.record_type,
+        &rrset.records,
+        rrset.ttl,
+    )
 }
 
 /// An endpoint's targets as deSEC's `records` array.
