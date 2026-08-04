@@ -114,6 +114,7 @@
 //! `docs/deployment.md` has the full manifests.
 
 pub mod adjust;
+pub mod apply;
 pub mod config;
 pub mod convert;
 pub mod error;

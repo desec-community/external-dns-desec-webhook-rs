@@ -60,10 +60,20 @@ impl WebhookError {
         }
     }
 
+    /// How long to tell external-dns to wait, if this error implies waiting.
+    ///
+    /// Also the signal used to pick which of several concurrent zone failures to report:
+    /// a throttle says how long to back off, which is more actionable than which record
+    /// deSEC disliked.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Unavailable { retry_after, .. } => Some(*retry_after),
+            Self::Internal(_) | Self::Encode(_) => None,
+        }
+    }
+
     fn retry_after_header(&self) -> Option<HeaderValue> {
-        let Self::Unavailable { retry_after, .. } = self else {
-            return None;
-        };
+        let retry_after = self.retry_after()?;
         let (min, max) = RETRY_AFTER_BOUNDS;
         let seconds = retry_after.as_secs().clamp(min, max);
         HeaderValue::try_from(seconds.to_string()).ok()
