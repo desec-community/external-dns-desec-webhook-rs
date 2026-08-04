@@ -1,0 +1,30 @@
+# Talks to the real deSEC API, so never on a push. Needs a token from a test account with
+# perm_create_domain and perm_delete_domain.
+name: live
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancelled and never concurrent: these create and delete scratch zones in a real
+# account, and two runs interleaving would fight over them and over the rate limiter.
+concurrency:
+  group: live-api-tests
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, 2026-07-17
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Live API tests
+        run: nix develop -c just live-test
+        env:
+          DESEC_TOKEN: ${{ secrets.DESEC_TOKEN }}
+          DESEC_TEST_PARENT: ${{ vars.DESEC_TEST_PARENT }}

@@ -1,0 +1,54 @@
+name: Checks
+description: >
+  Every check the project has, one named step each so a red run says which one failed without
+  anyone opening the log.
+
+runs:
+  using: composite
+  steps:
+    - name: Formatting
+      shell: bash
+      run: nix develop -c just fmt-check
+
+    - name: Clippy
+      shell: bash
+      run: nix develop -c just lint
+
+    - name: Tests
+      shell: bash
+      run: nix develop -c just test
+
+    - name: Build
+      shell: bash
+      run: nix develop -c just build
+
+    - name: Docs
+      shell: bash
+      run: nix develop -c just doc
+
+    - name: README is generated from lib.rs
+      shell: bash
+      run: nix develop -c just readme-check
+
+    - name: Lockfile is current
+      shell: bash
+      run: nix develop -c cargo metadata --locked --format-version 1 > /dev/null
+
+    - name: Crate packages cleanly
+      shell: bash
+      # Catches a manifest referencing files not in the tree, and a path dependency that
+      # would make `cargo publish` fail at the worst possible moment.
+      run: nix develop -c cargo package --locked --workspace
+
+    # For a binary the image is the artefact, so a green cargo build says nothing about
+    # whether what ships actually starts. `checks.image-starts` runs the binary with
+    # --check-config, which is the only check that catches an image without a CA bundle:
+    # rustls loads the trust store when the client is constructed, not at first request.
+    - name: Nix flake check
+      shell: bash
+      run: nix flake check --print-build-logs
+
+    - name: Image builds
+      shell: bash
+      if: runner.os == 'Linux'
+      run: nix build .#image --print-build-logs
