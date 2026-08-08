@@ -9,8 +9,12 @@
 //! 15s  external-dns client budget (--webhook-provider-read-timeout + --write-timeout)
 //!  └ 12s  tower::TimeoutLayer on the router          hard backstop
 //!     └ 9s  the deadline below                       so *we* choose the failure mode
-//!        └ 4s  desec::Client per-attempt timeout
+//!        └ 6s  one deSEC call: 2s pacing wait + 4s request
 //! ```
+//!
+//! The innermost line is two of `client`'s constants added together, not one: the limiter
+//! sleeps before `reqwest`'s timeout window opens rather than inside it. The gate below
+//! sits outside all of this.
 //!
 //! Choosing our own failure mode is the point. We answer 503 with a body and a
 //! `Retry-After` on a connection the client can reuse, rather than letting it time out and
@@ -296,20 +300,16 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A client tuned the way the binary tunes it. `max_retries(0)` is the load-bearing
-    /// line: `desec-rs` handles a 429 *before* checking whether the method is replayable,
-    /// so a bulk PATCH is retried on a throttle even though it is not retried on a 5xx.
-    /// With the crate's default of 3 retries and a `Retry-After: 30`, one throttled write
-    /// sleeps 90 seconds — which is the Go provider's failure mode, reproduced exactly.
+    /// The client the binary builds, pointed at a mock. Going through `crate::client`
+    /// rather than a builder chain of its own is the point: these tests cannot run a
+    /// configuration that differs from the shipped one.
     fn client(server: &MockServer) -> desec::Client {
-        desec::Client::builder()
-            .token("i-T3b1h_OI-H9ab8tRS98stGtURe")
-            .base_url(format!("{}/api/v1", server.uri()))
-            .max_retries(0)
-            .max_rate_limit_wait(Duration::from_secs(2))
-            .timeout(Duration::from_secs(4))
-            .build()
-            .expect("builds")
+        crate::client::build(
+            "i-T3b1h_OI-H9ab8tRS98stGtURe",
+            format!("{}/api/v1", server.uri()),
+            desec::RateLimits::desec_defaults(),
+        )
+        .expect("builds")
     }
 
     async fn store_with(rrsets: &[(&str, &str, u32, &[&str])]) -> SnapshotStore {
@@ -410,51 +410,77 @@ mod tests {
 
     /// The test that most distinguishes this provider from the one it replaces.
     ///
-    /// `Retry-After: 30` is chosen deliberately. The crate's default `max_retry_delay` is 60s,
-    /// and its 429 branch gives up immediately when the server's delay exceeds it — so a
-    /// `Retry-After` of 120 would *not* demonstrate anything. Thirty seconds is inside the
-    /// window, so with `max_retries: 3` the call would sleep 30s three times: about 90
-    /// seconds, against a client budget of 15.
+    /// One property, asserted of every `Retry-After` deSEC can send: the write reaches deSEC
+    /// **once**, and external-dns gets an answer it can act on well inside its budget. A
+    /// throttled request is rejected before the server processes it, so replaying it is safe
+    /// as far as the API is concerned — and the library does replay it, because it handles a
+    /// 429 before checking whether the method is replayable. Waiting is external-dns's job,
+    /// not ours; it has no deadline and we have fifteen seconds, once.
+    ///
+    /// The values straddle [`crate::client::MAX_RETRY_DELAY`], because that is where the
+    /// library's behaviour changes. Its guard is `attempt > max_retries || delay > max_delay`,
+    /// so anything above the ceiling returns at once whatever the retry count says, and only
+    /// the values at or below it can observe the retry count at all. At `Retry-After: 1`,
+    /// three retries would be four requests and three seconds; a single 30s case would not
+    /// notice.
     ///
     /// Timed against the wall clock rather than under `start_paused`: tokio auto-advances
     /// paused time whenever every task is idle, and a task awaiting a real socket looks
-    /// idle, so the client's own 4s timeout fires instantly and the request never completes.
+    /// idle, so the client's own timeout fires instantly and the request never completes.
     #[tokio::test]
-    async fn a_throttled_write_answers_503_far_inside_the_client_budget() {
-        let server = MockServer::start().await;
-        Mock::given(method("PATCH"))
-            .respond_with(
-                ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "30")
-                    .set_body_json(serde_json::json!({"detail": "Request was throttled."})),
-            )
-            .mount(&server)
-            .await;
+    async fn a_throttled_write_reaches_desec_once_whatever_retry_after_says() {
+        // `None` is the bare 429 an intermediary sends; `classify` supplies 60s for it.
+        for (retry_after, expected) in [
+            (None, 60),
+            (Some(1), 1),
+            (Some(30), 30),
+            (Some(60), 60),
+            (Some(3600), 3600),
+        ] {
+            let server = MockServer::start().await;
+            let mut response = ResponseTemplate::new(429)
+                .set_body_json(serde_json::json!({"detail": "Request was throttled."}));
+            if let Some(seconds) = retry_after {
+                response = response.insert_header("Retry-After", seconds.to_string().as_str());
+            }
+            // A fresh server and client each round, so one round's recorded penalty cannot
+            // pace the next one and make it look fast for the wrong reason.
+            Mock::given(method("PATCH"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
 
-        let store = store_with(&[]).await;
-        let applier = Applier::new(client(&server), store, false);
+            let store = store_with(&[]).await;
+            let applier = Applier::new(client(&server), store, false);
 
-        let started = std::time::Instant::now();
-        let outcome = applier
-            .apply(&Changes {
-                create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
-                ..Changes::default()
-            })
-            .await;
-        let elapsed = started.elapsed();
+            let started = Instant::now();
+            let outcome = applier
+                .apply(&Changes {
+                    create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
+                    ..Changes::default()
+                })
+                .await;
+            let elapsed = started.elapsed();
 
-        let error = outcome.error.expect("throttling is reported");
-        assert_eq!(error.status().as_u16(), 503, "never 429: that is permanent");
-        assert_eq!(
-            error.retry_after(),
-            Some(Duration::from_secs(30)),
-            "deSEC's own Retry-After is passed on"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "answered in {elapsed:?}; external-dns allows 15s for the whole round trip, once"
-        );
-        assert!(!outcome.report.timed_out);
+            // Before the assertions below, so a replayed write is diagnosed as the extra
+            // requests it is rather than as the seconds they took.
+            server.verify().await;
+
+            let error = outcome.error.expect("throttling is reported");
+            assert_eq!(error.status().as_u16(), 503, "never 429: that is permanent");
+            assert_eq!(
+                error.retry_after(),
+                Some(Duration::from_secs(expected)),
+                "Retry-After {retry_after:?} should reach external-dns as {expected}s"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "Retry-After {retry_after:?} answered in {elapsed:?}; external-dns allows 15s \
+                 for the whole round trip, once"
+            );
+            assert!(!outcome.report.timed_out);
+        }
     }
 
     #[tokio::test]
