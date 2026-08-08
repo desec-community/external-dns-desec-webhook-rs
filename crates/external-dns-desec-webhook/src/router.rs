@@ -179,6 +179,12 @@ async fn apply_changes(
     for (zone, rrsets) in &outcome.report.written {
         state.metrics.record_write(zone, "ok", *rrsets);
     }
+    // A write we declined to make. Counted because it is the one outcome here that is
+    // invisible from outside: no request, so it can never reach `desec_requests_total`, and
+    // a 503 that looks like every other 503 in `soft_errors`.
+    for (zone, _) in &outcome.report.cooling_down {
+        state.metrics.record_write(zone, "cooling_down", 0);
+    }
     let result = if outcome.report.timed_out {
         "timeout"
     } else if outcome.error.is_some() {
