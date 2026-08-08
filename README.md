@@ -37,6 +37,13 @@ Two properties follow from that, and everything else here is in service of them:
   zone's own `minimum_ttl` before external-dns compares them, and any write that
   would not change stored state is dropped.
 
+**So leave external-dns's `--interval` wherever you like.** It costs deSEC nothing: the
+read endpoints are served from a snapshot, and a cycle that changes nothing makes no
+request. Nor does it cost anything while deSEC is throttling us — a zone that has just
+been refused is left alone until the wait deSEC named elapses, rather than being asked
+again every cycle. The knob that does spend budget is `--refresh-interval`, which is
+ours, and the webhook reports what your setting costs at startup.
+
 ## Configuration
 
 Every setting is a flag and an environment variable; `--help` is authoritative.
@@ -52,6 +59,7 @@ Every setting is a flag and an environment variable; `--help` is authoritative.
 | `WEBHOOK_ADMIN_LISTEN` | `--admin-listen` | `0.0.0.0:8080` | health and metrics |
 | `WEBHOOK_REFRESH_INTERVAL` | `--refresh-interval` | `180s` | independent of `--interval` |
 | `WEBHOOK_MAX_ZONE_AGE` | `--max-zone-age` | `6h` | forced re-list backstop |
+| `WEBHOOK_MAX_THROTTLE_COOLDOWN` | `--max-throttle-cooldown` | `1h` | `0` disables |
 | `WEBHOOK_DRY_RUN` | `--dry-run` | `false` | |
 | `WEBHOOK_ALLOW_EMPTY_ZONE_SET` | `--allow-empty-zone-set` | `false` | see below |
 | `WEBHOOK_METRICS_ZONE_LABELS` | `--metrics-zone-labels` | `false` | |
