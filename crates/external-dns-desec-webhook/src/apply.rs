@@ -19,9 +19,17 @@
 //! Choosing our own failure mode is the point. We answer 503 with a body and a
 //! `Retry-After` on a connection the client can reuse, rather than letting it time out and
 //! classify a torn connection as a transport error.
+//!
+//! The cooldown is the other half of that. Answering fast is not the same as not asking:
+//! external-dns reads the status code and nothing else, so it comes back on its own
+//! `--interval` whatever `Retry-After` we sent, and a zone that earns a 429 would earn
+//! another one every cycle. So a zone deSEC has just refused is not asked again until the
+//! wait it named elapses. external-dns sees the same 503 either way; deSEC sees one request
+//! per cooldown instead of one per minute.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use desec::api::rrsets::BulkPatch;
 use tokio::sync::Semaphore;
@@ -47,12 +55,73 @@ const FAN_OUT: usize = 8;
 /// What `Retry-After` to offer when our own deadline is what failed.
 const DEADLINE_RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// Zones deSEC has refused a write to, and until when.
+///
+/// The limiter inside `desec-rs` cannot do this job. It clamps a stored penalty to
+/// `max_wait` — 2s here, and deliberately, because that same value is how long `acquire`
+/// may sleep — so two seconds after a 429 it believes the account is admissible again.
+/// This is that memory, kept where it matters, for as long as deSEC said.
+#[derive(Clone)]
+struct Cooldown {
+    until: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Longest to believe one response. Zero disables the whole thing.
+    cap: Duration,
+}
+
+impl Cooldown {
+    fn new(cap: Duration) -> Self {
+        Self {
+            until: Arc::new(Mutex::new(HashMap::new())),
+            cap,
+        }
+    }
+
+    /// How long is left, if this zone is still cooling down.
+    ///
+    /// A lapsed entry is dropped here rather than left for the next write, so a zone that
+    /// is throttled once and then goes quiet does not keep an entry for the life of the
+    /// process.
+    fn remaining(&self, zone: &str) -> Option<Duration> {
+        let mut until = self.until.lock().expect("cooldown mutex");
+        let deadline = *until.get(zone)?;
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(left) if !left.is_zero() => Some(left),
+            _ => {
+                until.remove(zone);
+                None
+            }
+        }
+    }
+
+    /// Remember that deSEC refused a write to this zone, for as long as it said.
+    fn record(&self, zone: &str, wait: Duration) {
+        if self.cap.is_zero() {
+            return;
+        }
+        let Some(deadline) = Instant::now().checked_add(wait.min(self.cap)) else {
+            return;
+        };
+        self.until
+            .lock()
+            .expect("cooldown mutex")
+            .insert(zone.to_owned(), deadline);
+    }
+
+    /// Forget a zone: its write landed, or it is gone from the account.
+    fn clear(&self, zone: &str) {
+        self.until.lock().expect("cooldown mutex").remove(zone);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ApplyReport {
     /// Changes that became no requests, by reason.
     pub suppressed: plan::Tally,
     /// Zone name and how many RRsets its one request carried.
     pub written: Vec<(String, usize)>,
+    /// Zones left alone because deSEC refused them recently, and how long is left. No
+    /// request was made for any of these.
+    pub cooling_down: Vec<(String, Duration)>,
     pub zones_failed: usize,
     /// True when our own deadline fired rather than a request failing.
     pub timed_out: bool,
@@ -81,6 +150,8 @@ pub struct Applier {
     client: desec::Client,
     store: SnapshotStore,
     dry_run: bool,
+    /// Zones deSEC has already refused, so we do not spend a request finding out again.
+    cooldown: Cooldown,
     /// Serializes applies against each other.
     ///
     /// external-dns should not overlap two reconciles, but if it does, two handlers
@@ -89,11 +160,17 @@ pub struct Applier {
 }
 
 impl Applier {
-    pub fn new(client: desec::Client, store: SnapshotStore, dry_run: bool) -> Self {
+    pub fn new(
+        client: desec::Client,
+        store: SnapshotStore,
+        dry_run: bool,
+        cooldown_cap: Duration,
+    ) -> Self {
         Self {
             client,
             store,
             dry_run,
+            cooldown: Cooldown::new(cooldown_cap),
             gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -140,15 +217,53 @@ impl Applier {
             };
         }
 
-        let attempted: Vec<String> = plan.zones.iter().map(|zone| zone.zone.clone()).collect();
-        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut writable = Vec::new();
+        let mut cooling = Vec::new();
+        for zone in plan.zones {
+            match self.cooldown.remaining(&zone.zone) {
+                Some(wait) => {
+                    tracing::info!(
+                        zone = %zone.zone,
+                        rrsets = zone.patches.len(),
+                        wait_s = wait.as_secs(),
+                        "still cooling down after a deSEC throttle; not writing"
+                    );
+                    cooling.push((zone.zone, wait));
+                }
+                None => writable.push(zone),
+            }
+        }
 
-        let timed_out = tokio::time::timeout(DEADLINE, self.write_all(plan.zones, &results))
+        // Only what we actually attempt. A cooling zone has to stay out of this, or the
+        // deadline path below invalidates a zone nothing touched and buys a forced re-list
+        // while the account is throttled.
+        let attempted: Vec<String> = writable.iter().map(|zone| zone.zone.clone()).collect();
+
+        // Seeded with the cooling zones, so the loop below reports them without knowing they
+        // are special: it already prefers an error carrying a wait over a rejection.
+        let results: ZoneResults = Arc::new(Mutex::new(
+            cooling
+                .iter()
+                .map(|(zone, wait)| {
+                    let reported = WebhookError::unavailable(
+                        format!(
+                            "deSEC throttled writes to {zone}; not asking again for {}s",
+                            wait.as_secs()
+                        ),
+                        *wait,
+                    );
+                    (zone.clone(), Err(reported))
+                })
+                .collect(),
+        ));
+
+        let timed_out = tokio::time::timeout(DEADLINE, self.write_all(writable, &results))
             .await
             .is_err();
 
         let mut report = ApplyReport {
             suppressed: plan.tally,
+            cooling_down: cooling,
             timed_out,
             ..ApplyReport::default()
         };
@@ -212,6 +327,7 @@ impl Applier {
         for zone in zones {
             let client = self.client.clone();
             let store = self.store.clone();
+            let cooldown = self.cooldown.clone();
             let permits = Arc::clone(&permits);
             let results = Arc::clone(results);
 
@@ -219,7 +335,7 @@ impl Applier {
                 let Ok(_permit) = permits.acquire().await else {
                     return;
                 };
-                let outcome = write_zone(&client, &store, &zone).await;
+                let outcome = write_zone(&client, &store, &cooldown, &zone).await;
                 results
                     .lock()
                     .expect("results mutex")
@@ -232,9 +348,12 @@ impl Applier {
 }
 
 /// One zone, one atomic request.
+///
+/// The caller has already checked the cooldown; this is what records into it.
 async fn write_zone(
     client: &desec::Client,
     store: &SnapshotStore,
+    cooldown: &Cooldown,
     plan: &ZonePlan,
 ) -> Result<usize, WebhookError> {
     let rrsets = plan.patches.len();
@@ -242,6 +361,8 @@ async fn write_zone(
 
     match client.rrsets(&plan.zone).patch_bulk(&plan.patches).await {
         Ok(confirmed) => {
+            // Whatever deSEC said before, it is writing now.
+            cooldown.clear(&plan.zone);
             store
                 .apply_confirmed(&plan.zone, &confirmed, &plan.deleted)
                 .await;
@@ -250,11 +371,29 @@ async fn write_zone(
         Err(error) => {
             let reported = classify(&error);
 
+            // First, and before any await: this runs in a task the deadline can drop, and
+            // that deSEC refused us is the thing least worth losing.
+            //
+            // Matched on the variant rather than through `error.is_rate_limited()`, which is
+            // also true for `RateLimitWouldBlock` — our own limiter declining before a
+            // request exists, so nothing was refused and there is nothing to remember. It
+            // also keeps out the 300s `classify` gives a 401/403, where retrying is how we
+            // find out the secret has been rotated.
+            //
+            // The wait comes from `reported`, so what we remember and what we tell
+            // external-dns cannot drift — including the 60s substituted for a bare 429.
+            if matches!(error, desec::Error::RateLimited { .. }) {
+                if let Some(wait) = reported.retry_after() {
+                    cooldown.record(&plan.zone, wait);
+                }
+            }
+
             if error.is_not_found() {
                 // The zone is gone from the account. Keeping it would wedge the cycle:
                 // external-dns goes on planning changes for it, and every write 404s.
                 tracing::warn!(zone = %plan.zone, "zone no longer exists; dropping it");
                 store.forget(&plan.zone).await;
+                cooldown.clear(&plan.zone);
             } else {
                 store.invalidate(&plan.zone).await;
             }
@@ -263,6 +402,7 @@ async fn write_zone(
                 zone = %plan.zone,
                 rrsets,
                 error = %error,
+                retry_after_s = reported.retry_after().map(|wait| wait.as_secs()),
                 patches = %describe(&plan.patches),
                 "write failed"
             );
@@ -299,6 +439,10 @@ mod tests {
     use std::time::Instant;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// What `--max-throttle-cooldown` defaults to. Long enough that any test making two
+    /// applies sees the second one declined; `config::tests` pins the default itself.
+    const COOLDOWN: Duration = Duration::from_secs(3600);
 
     /// The client the binary builds, pointed at a mock. Going through `crate::client`
     /// rather than a builder chain of its own is the point: these tests cannot run a
@@ -363,7 +507,7 @@ mod tests {
             .await;
 
         let store = store_with(&[("www", "A", 3600, &["192.0.2.1"])]).await;
-        let applier = Applier::new(client(&server), store, false);
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
 
         let outcome = applier
             .apply(&Changes {
@@ -389,7 +533,7 @@ mod tests {
             .await;
 
         let store = store_with(&[("www", "A", 3600, &["192.0.2.1"])]).await;
-        let applier = Applier::new(client(&server), store, false);
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
 
         let outcome = applier
             .apply(&Changes {
@@ -452,7 +596,7 @@ mod tests {
                 .await;
 
             let store = store_with(&[]).await;
-            let applier = Applier::new(client(&server), store, false);
+            let applier = Applier::new(client(&server), store, false, COOLDOWN);
 
             let started = Instant::now();
             let outcome = applier
@@ -483,6 +627,289 @@ mod tests {
         }
     }
 
+    /// The test of the cooldown, and the one that is red without it.
+    ///
+    /// external-dns reads only the status code of our answer, so it returns every
+    /// `--interval` whatever `Retry-After` we sent. Before this, each of those cycles spent
+    /// another bulk PATCH that could only be refused, against a budget of 300 a day.
+    #[tokio::test]
+    async fn a_second_apply_after_a_throttle_costs_no_request_until_the_cooldown_lapses() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "300")
+                    .set_body_json(serde_json::json!({"detail": "Request was throttled."})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = store_with(&[]).await;
+        // One applier across both applies: the cooldown lives here, and two reconciles
+        // against one process is exactly the case.
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
+        let changes = Changes {
+            create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
+            ..Changes::default()
+        };
+
+        let first = applier.apply(&changes).await;
+        let second = applier.apply(&changes).await;
+
+        server.verify().await;
+
+        assert_eq!(
+            first.error.expect("throttled").retry_after(),
+            Some(Duration::from_secs(300))
+        );
+        let error = second.error.expect("still declined");
+        assert_eq!(error.status().as_u16(), 503, "external-dns sees no change");
+        let left = error.retry_after().expect("says how long is left");
+        assert!(
+            left <= Duration::from_secs(300) && !left.is_zero(),
+            "counts down from deSEC's own wait, got {left:?}"
+        );
+        assert_eq!(second.report.cooling_down.len(), 1);
+        assert_eq!(second.report.requests(), 0);
+    }
+
+    /// The counterpart: the cooldown lets go on its own, without anything clearing it.
+    #[tokio::test]
+    async fn a_zone_whose_cooldown_has_lapsed_is_written_on_the_next_apply() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .set_body_json(serde_json::json!({"detail": "Request was throttled."})),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = store_with(&[]).await;
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
+        let changes = Changes {
+            create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
+            ..Changes::default()
+        };
+
+        assert!(applier.apply(&changes).await.error.is_some());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let after = applier.apply(&changes).await;
+
+        server.verify().await;
+        assert!(after.error.is_none(), "the write is attempted again");
+        assert_eq!(after.report.requests(), 1);
+    }
+
+    /// Only a server throttle earns a cooldown.
+    ///
+    /// `error.is_rate_limited()` is the helper this reaches past, and it is wrong twice
+    /// over: it is true for `RateLimitWouldBlock`, which is our own limiter declining before
+    /// a request exists, and going through the classified error instead would pick up the
+    /// 300s a 401/403 carries — where retrying is precisely how we find out that the secret
+    /// has been rotated.
+    #[tokio::test]
+    async fn a_failure_that_is_not_a_server_throttle_does_not_gate_the_next_write() {
+        for status in [400, 401, 403, 500] {
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"detail": "nope"})),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let store = store_with(&[]).await;
+            let applier = Applier::new(client(&server), store, false, COOLDOWN);
+            let changes = Changes {
+                create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
+                ..Changes::default()
+            };
+
+            applier.apply(&changes).await;
+            let second = applier.apply(&changes).await;
+
+            server.verify().await;
+            assert!(
+                second.report.cooling_down.is_empty(),
+                "{status} must not cool the zone down"
+            );
+        }
+    }
+
+    /// A 429 names no scope, so it is evidence about the zone that earned it and nothing
+    /// else. Cooling a zone that never failed would trade availability for budget.
+    #[tokio::test]
+    async fn a_throttle_on_one_zone_does_not_silence_another() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/domains/a.example.com/rrsets/"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "300")
+                    .set_body_json(serde_json::json!({"detail": "Request was throttled."})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/domains/b.example.com/rrsets/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let store = SnapshotStore::new();
+        store
+            .publish(RefreshUpdate {
+                present: vec!["a.example.com".to_owned(), "b.example.com".to_owned()],
+                listed: ["a.example.com", "b.example.com"]
+                    .into_iter()
+                    .map(|name| ListedZone {
+                        name: name.to_owned(),
+                        minimum_ttl: 3600,
+                        touched: None,
+                        rrsets: HashMap::new(),
+                        epoch_at_start: 0,
+                    })
+                    .collect(),
+                zone_list_ok: true,
+                error: None,
+            })
+            .await;
+
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
+        let changes = Changes {
+            create: vec![
+                endpoint("x.a.example.com", "A", &["192.0.2.1"]),
+                endpoint("x.b.example.com", "A", &["192.0.2.1"]),
+            ],
+            ..Changes::default()
+        };
+
+        applier.apply(&changes).await;
+        let second = applier.apply(&changes).await;
+
+        server.verify().await;
+        assert_eq!(
+            second.report.cooling_down,
+            vec![("a.example.com".to_owned(), second.report.cooling_down[0].1)],
+            "only the zone that earned the 429"
+        );
+    }
+
+    /// A cooling zone was not attempted, so nothing about it may be touched.
+    ///
+    /// Asserted on the snapshot generation rather than on `touched`, which the first 429's
+    /// own invalidation has already cleared: the claim is that the second apply mutates the
+    /// store not at all, and a forced re-list is a read request spent on a zone we
+    /// deliberately did not write while the account is throttled.
+    #[tokio::test]
+    async fn a_zone_that_is_cooling_down_is_not_invalidated_because_nothing_was_attempted() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "300")
+                    .set_body_json(serde_json::json!({"detail": "Request was throttled."})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = store_with(&[]).await;
+        let applier = Applier::new(client(&server), store.clone(), false, COOLDOWN);
+        let changes = Changes {
+            create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
+            ..Changes::default()
+        };
+
+        applier.apply(&changes).await;
+        let settled = store.load().generation;
+        applier.apply(&changes).await;
+
+        server.verify().await;
+        assert_eq!(store.load().generation, settled, "no store write at all");
+    }
+
+    /// A dry run makes no request, so it can never be throttled and must never be declined.
+    #[tokio::test]
+    async fn a_dry_run_is_never_cooled_down_because_it_never_asks() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let store = store_with(&[]).await;
+        let applier = Applier::new(client(&server), store, true, COOLDOWN);
+        let changes = Changes {
+            create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],
+            ..Changes::default()
+        };
+
+        assert!(applier.apply(&changes).await.error.is_none());
+        assert!(applier.apply(&changes).await.error.is_none());
+        server.verify().await;
+    }
+
+    #[test]
+    fn a_cooldown_lapses_on_its_own_without_anything_clearing_it() {
+        let cooldown = Cooldown::new(COOLDOWN);
+        cooldown.record("example.com", Duration::from_millis(50));
+        assert!(cooldown.remaining("example.com").is_some());
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        assert!(cooldown.remaining("example.com").is_none());
+        assert!(
+            cooldown.until.lock().expect("cooldown mutex").is_empty(),
+            "a zone throttled once and then quiet leaves no entry behind"
+        );
+    }
+
+    #[test]
+    fn a_cooldown_offers_the_time_that_is_left_rather_than_the_time_it_started_with() {
+        let cooldown = Cooldown::new(COOLDOWN);
+        cooldown.record("example.com", Duration::from_secs(300));
+        std::thread::sleep(Duration::from_millis(20));
+
+        let left = cooldown.remaining("example.com").expect("still cooling");
+        assert!(
+            left < Duration::from_secs(300) && left > Duration::from_secs(299),
+            "counts down, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn a_cooldown_never_outlasts_its_ceiling_whatever_desec_says() {
+        let cooldown = Cooldown::new(Duration::from_secs(3600));
+        // 24h is desec-rs's own clamp on the header, so the largest value that can reach us.
+        cooldown.record("example.com", Duration::from_secs(86_400));
+
+        let left = cooldown.remaining("example.com").expect("still cooling");
+        assert!(left <= Duration::from_secs(3600), "capped, got {left:?}");
+    }
+
+    #[test]
+    fn a_disabled_cooldown_remembers_nothing() {
+        let cooldown = Cooldown::new(Duration::ZERO);
+        cooldown.record("example.com", Duration::from_secs(300));
+        assert!(cooldown.remaining("example.com").is_none());
+    }
+
     #[tokio::test]
     async fn a_rejected_write_invalidates_the_zone_rather_than_trusting_the_cache() {
         let server = MockServer::start().await;
@@ -495,7 +922,7 @@ mod tests {
             .await;
 
         let store = store_with(&[("www", "A", 3600, &["192.0.2.1"])]).await;
-        let applier = Applier::new(client(&server), store.clone(), false);
+        let applier = Applier::new(client(&server), store.clone(), false, COOLDOWN);
 
         let outcome = applier
             .apply(&Changes {
@@ -531,7 +958,7 @@ mod tests {
             .await;
 
         let store = store_with(&[]).await;
-        let applier = Applier::new(client(&server), store.clone(), false);
+        let applier = Applier::new(client(&server), store.clone(), false, COOLDOWN);
 
         applier
             .apply(&Changes {
@@ -563,7 +990,7 @@ mod tests {
             .await;
 
         let store = store_with(&[]).await;
-        let applier = Applier::new(client(&server), store.clone(), false);
+        let applier = Applier::new(client(&server), store.clone(), false, COOLDOWN);
 
         applier
             .apply(&Changes {
@@ -590,7 +1017,7 @@ mod tests {
             .await;
 
         let store = store_with(&[]).await;
-        let applier = Applier::new(client(&server), store, true);
+        let applier = Applier::new(client(&server), store, true, COOLDOWN);
 
         let outcome = applier
             .apply(&Changes {
@@ -614,7 +1041,7 @@ mod tests {
             .await;
 
         let store = store_with(&[]).await;
-        let applier = Applier::new(client(&server), store, false);
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
 
         let outcome = applier
             .apply(&Changes {
@@ -672,7 +1099,7 @@ mod tests {
             })
             .await;
 
-        let applier = Applier::new(client(&server), store, false);
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
         let outcome = applier
             .apply(&Changes {
                 create: vec![
@@ -709,7 +1136,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let applier = Applier::new(client(&server), store, false);
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
         let outcome = applier
             .apply(&Changes {
                 create: vec![endpoint("new.example.com", "A", &["192.0.2.1"])],

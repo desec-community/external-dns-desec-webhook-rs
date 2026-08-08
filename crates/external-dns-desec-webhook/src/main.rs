@@ -86,6 +86,14 @@ async fn run(config: Config) -> Result<(), StartupError> {
         );
     }
 
+    if config.max_throttle_cooldown.is_zero() {
+        tracing::warn!(
+            "--max-throttle-cooldown is zero, so a zone deSEC has just refused will be written \
+             to again on the next reconcile. Every one of those requests is counted against \
+             the budget that is already exhausted."
+        );
+    }
+
     let estimated = config.estimated_daily_reads(u32::try_from(zones.len()).unwrap_or(u32::MAX));
     tracing::info!(
         zones = ?zones,
@@ -123,7 +131,12 @@ async fn run(config: Config) -> Result<(), StartupError> {
 
     let provider = router::router(router::AppState {
         store: store.clone(),
-        applier: Arc::new(Applier::new(client, store.clone(), config.dry_run)),
+        applier: Arc::new(Applier::new(
+            client,
+            store.clone(),
+            config.dry_run,
+            config.max_throttle_cooldown,
+        )),
         metrics: Arc::clone(&metrics),
         // The filter external-dns is told about comes from configuration, not from the API,
         // so the handshake cannot fail because deSEC is unreachable. It happens once at
