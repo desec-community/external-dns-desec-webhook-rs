@@ -382,14 +382,12 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(server: &MockServer) -> desec::Client {
-        desec::Client::builder()
-            .token("i-T3b1h_OI-H9ab8tRS98stGtURe")
-            .base_url(format!("{}/api/v1", server.uri()))
-            .max_retries(0)
-            .max_rate_limit_wait(Duration::from_secs(2))
-            .timeout(Duration::from_secs(4))
-            .build()
-            .expect("builds")
+        crate::client::build(
+            "i-T3b1h_OI-H9ab8tRS98stGtURe",
+            format!("{}/api/v1", server.uri()),
+            desec::RateLimits::desec_defaults(),
+        )
+        .expect("builds")
     }
 
     fn refresher(server: &MockServer, store: SnapshotStore, include: &[&str]) -> Refresher {

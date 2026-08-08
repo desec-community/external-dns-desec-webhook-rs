@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use external_dns_desec_webhook::{
-    Config, admin, apply::Applier, config::ConfigError, metrics::Metrics, refresh::Refresher,
-    router, store::SnapshotStore, wire::DomainFilter,
+    Config, admin, apply::Applier, client, config::ConfigError, metrics::Metrics,
+    refresh::Refresher, router, store::SnapshotStore, wire::DomainFilter,
 };
 
 /// How long in-flight requests get to finish after a shutdown signal.
@@ -68,25 +68,8 @@ async fn run(config: Config) -> Result<(), StartupError> {
     let zones = config.zones()?;
     let excluded = config.excluded_zones();
 
-    // Constructing the client is what `--check-config` is for: reqwest's rustls backend loads
-    // the system trust store here, not at first request, so a container image without a CA
-    // bundle fails on this line and passes every unit test.
-    let client = desec::Client::builder()
-        .token(config.token()?)
-        .base_url(&config.api_url)
-        .user_agent(concat!(
-            "external-dns-desec-webhook/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        // Every knob below is tuned for the write path, because that is the one with a
-        // deadline. See `apply` for why max_retries(0) is load-bearing rather than merely
-        // conservative.
-        .timeout(Duration::from_secs(4))
-        .max_rate_limit_wait(Duration::from_secs(2))
-        .max_retries(0)
-        .max_retry_delay(Duration::from_secs(1))
-        .rate_limits(config.rate_limits()?)
-        .build()
+    // The tuning lives in `client`, which is also what `--check-config` exercises.
+    let client = client::build(config.token()?, &config.api_url, config.rate_limits()?)
         .map_err(StartupError::Client)?;
 
     if config.check_config {

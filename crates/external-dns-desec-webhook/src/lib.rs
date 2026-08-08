@@ -118,6 +118,7 @@
 pub mod adjust;
 pub mod admin;
 pub mod apply;
+pub mod client;
 pub mod config;
 pub mod convert;
 pub mod error;

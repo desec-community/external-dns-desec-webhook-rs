@@ -348,14 +348,12 @@ impl Harness {
         let mock = DesecMock::new(zones);
         mock.mount(&server).await;
 
-        let client = desec::Client::builder()
-            .token(TOKEN)
-            .base_url(format!("{}/api/v1", server.uri()))
-            .max_retries(0)
-            .max_rate_limit_wait(Duration::from_secs(2))
-            .timeout(Duration::from_secs(4))
-            .build()
-            .unwrap();
+        let client = external_dns_desec_webhook::client::build(
+            TOKEN,
+            format!("{}/api/v1", server.uri()),
+            desec::RateLimits::desec_defaults(),
+        )
+        .unwrap();
 
         let store = SnapshotStore::new();
         let metrics = Arc::new(Metrics::new(false, "integration"));
