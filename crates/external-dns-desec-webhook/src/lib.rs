@@ -11,7 +11,7 @@
 //!   webhook:
 //!     image:
 //!       repository: ghcr.io/desec-community/external-dns-desec-webhook-rs
-//!       tag: v0.0.1
+//!       tag: "<version goes here>"
 //!     env:
 //!       - name: DESEC_TOKEN_FILE
 //!         value: /etc/desec/token
@@ -21,12 +21,12 @@
 //!   - --txt-prefix=externaldns-%{record_type}.
 //! ```
 //!
-//! # Why this exists
+//! # deSEC rate limits, external-dns request budget
 //!
 //! deSEC caps RRset writes at 300 per day per domain and any authenticated request at
 //! 2000 per day for the whole account. external-dns reconciles every minute by default,
 //! which is 1440 cycles a day. A provider that writes once per cycle exhausts the write
-//! budget before lunch, and a provider that blocks while throttled runs past
+//! budget in 5 hours, and a provider that blocks while throttled runs past
 //! external-dns's 15-second client timeout and takes external-dns down with it.
 //!
 //! Two properties follow from that, and everything else here is in service of them:
