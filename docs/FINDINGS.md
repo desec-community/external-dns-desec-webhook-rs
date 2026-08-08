@@ -1,11 +1,21 @@
 # Findings
 
-Nine things that changed the implementation, found by reading source rather than documentation.
-Each section says what the mechanism is, what would have gone wrong, and what the code does about
-it.
+Two batches, from two different kinds of work.
 
-Two of these corrected claims I had already written into comments. Those corrections are marked,
-because a wrong reason in a comment is worse than no reason at all.
+**§1–§9** changed the implementation, and were found by reading source rather than documentation.
+Each says what the mechanism is, what would have gone wrong, and what the code does about it.
+
+**§10–§19** were found by *running* the Go provider this replaces, and are correlated against
+this codebase here rather than acted on. They come from [external-dns-desec-provider#26][pr26]
+— a year of production fixes — from the review of it, and from
+[sshine/external-dns-desec-provider#2][pr2], another operator's account of the same failure from
+a four-cluster deployment. Some describe holes this design has that the Go provider does not.
+Some describe problems this design retired outright, recorded so they are not re-litigated. One
+is a correction to §4. **None of them is a decision**; several are almost certainly not worth
+their complexity.
+
+Corrections to claims I had already written into comments or docs are marked, because a wrong
+reason in a comment is worse than no reason at all.
 
 ______________________________________________________________________
 
@@ -550,3 +560,518 @@ value genuinely did come off the wire.
 If `desec-rs` ever grows a caching layer, it will hit exactly this. Either `Rrset` gains a
 `from_parts` constructor, or the cache stores parts — and the parts turn out to be the better
 representation anyway, because they are what the write API takes.
+
+______________________________________________________________________
+
+## 10. A `429` with no `Retry-After` teaches the limiter nothing
+
+### The mechanism
+
+`desec-rs`, `ratelimit.rs`:
+
+```rust
+pub(crate) fn record_throttled(&self, scopes: &ScopeSet, retry_after: Option<Duration>) {
+    let Some(retry_after) = retry_after else {
+        return;
+    };
+    ...
+}
+```
+
+No header, no penalty. The sliding windows are untouched too, because they record *grants* and a
+throttled request was never granted. So a millisecond after a bare 429, the limiter's model of the
+account is exactly what it was a millisecond before: admissible.
+
+Our `classify` covers for this on the wire, but only there:
+
+```rust
+desec::Error::RateLimited { retry_after, .. } => WebhookError::unavailable(
+    "deSEC returned 429 Too Many Requests",
+    retry_after.unwrap_or(Duration::from_secs(60)),
+),
+```
+
+That fills in the `Retry-After` we send external-dns. It does not reach the limiter, and per §1
+external-dns retries on its own `--interval` regardless of what that header says. So the next
+reconcile's `POST /records` goes straight to the wire and earns another 429, and so does the one
+after it.
+
+CodeRabbit found this in the Go provider's transport and proposed recording a conservative default
+in the missing-header branch. The same one-line shape applies here, except it belongs upstream in
+`desec-rs`.
+
+### How likely it is
+
+Not very, and that is the interesting part. deSEC runs Django REST Framework throttles, which
+always set `Retry-After` from `wait()`. The realistic sources of a bare 429 are all
+*intermediaries*: a corporate proxy, a CDN in front of a self-hosted deSEC reached via
+`--api-url`, a service-mesh limiter, or deSEC's own front end shedding load before the application
+sees the request.
+
+Which is to say: the case where the client most needs to back off unprompted is the one case where
+it doesn't.
+
+### Where we stand
+
+Unhandled. The remedy is upstream and small, and the only argument against it is that a penalty
+invented from nothing is a guess. `max_rate_limit_wait` already bounds how wrong that guess can be
+(§11), which makes it a cheap one.
+
+______________________________________________________________________
+
+## 11. The limiter's memory of a throttle is two seconds long
+
+**This qualifies a claim in §1.**
+
+### The mechanism
+
+`record_throttled` again, one line further down:
+
+```rust
+let Some(until) = Instant::now().checked_add(retry_after.min(self.max_wait)) else { return };
+```
+
+§1 reads `.min(self.max_wait)` as a safety valve, and it is one: `Scope::User` is in every
+request's scope set, so an uncapped `Retry-After: 3600` would idle the entire client for an hour on
+the strength of one response. But the cap does not merely *bound* the penalty. It **is** the
+penalty. With `max_rate_limit_wait(2s)`, every throttle deSEC reports — thirty seconds, twelve
+hours — becomes the same two-second local backoff.
+
+So §1's closing sentence needs a clause:
+
+> Nothing is lost by not retrying, because `record_throttled` has *already* run by that point — the
+> shared limiter has learned the penalty, so every other task backs off without having to earn its
+> own 429.
+
+True for two seconds. After that, every task earns its own.
+
+### Why it is nevertheless close to right
+
+What paces this provider is not the penalty, it is the sliding windows — and those are accurate for
+as long as we are the only client on the account. Around them:
+
+- The refresher doubles its own backoff to 900s on a failed tick, so a throttled read path stops
+  asking without needing the limiter's help.
+- The write path has no backoff of its own, but a write is gated behind `Applier::gate`, capped at
+  one bulk `PATCH` per zone per apply, and suppressed entirely when nothing would change. Its
+  worst case is one request per zone per external-dns interval, which is not hammering.
+
+The two-second penalty therefore only matters in one situation: when the windows are wrong because
+**something else is spending the same budget**. Then the penalty is the only corrective signal
+there is, and it lasts two seconds.
+
+### The case the windows cannot model
+
+That situation is not hypothetical. It is what [pr2] is about:
+
+> This fixes a scenario where requests to the rrset endpoint kept piling up in a way that 4
+> clusters exhausted the 50/min limit within seconds.
+
+Four processes, one token. Each one paces itself correctly against limits that describe the
+*account*, each believes it may spend `50/min` of `dns_api_cheap`, and between them they may spend
+50\. Every participant is well-behaved and the account is throttled anyway. See §18.
+
+### Where we stand
+
+Raising `max_rate_limit_wait` would lengthen the memory and lengthen the worst-case in-handler
+wait by the same amount (§15) — the two are the same number, which is the awkward part. Decoupling
+them upstream (a penalty ceiling separate from the wait ceiling) is the clean fix and is a
+`desec-rs` change, not one here.
+
+______________________________________________________________________
+
+## 12. The write path emits no deSEC request metrics at all
+
+### The mechanism
+
+`op::WRITE` is defined in `metrics.rs` and used nowhere but `metrics.rs`'s own test. Following the
+call sites:
+
+- `record_desec_error` and `record_desec_ok` are called only from `refresh.rs`.
+- `record_write` is called only from `router.rs`, and only ever with `"ok"`.
+- `ApplyReport::zones_failed` is set by `apply` and read by nothing.
+
+So `webhook_desec_requests_total` only ever carries `op="list_zones"` and `op="list_rrsets"`. The
+headline diagnostic in `docs/rate-limits.md` —
+
+> **`webhook_desec_requests_total{outcome="would_block"}` versus `outcome="throttled"`**
+
+— describes only the read path. On the write path, which is the one with the 300-per-zone-per-day
+budget, a throttle and a rejection are indistinguishable: both are one increment of
+`soft_errors{endpoint="apply"}` and one `apply_duration_seconds{reason="error"}` sample. (A
+deadline is distinguishable, via `reason="timeout"`.)
+
+### Why the plumbing is missing
+
+Not an oversight so much as a consequence of where the abstraction was drawn. `write_zone` calls
+`classify(&error)` and returns a `WebhookError`, so by the time the router sees an outcome the
+`desec::Error` is gone — and `WebhookError::Unavailable` covers throttled, would-block,
+unauthorized *and* our own deadline as one variant. `Applier` deliberately holds no `Arc<Metrics>`,
+which is what keeps `apply.rs` testable without one, and `ApplyOutcome` was meant to carry
+everything the router needs. It carries everything the router needs to *answer*, and nothing it
+needs to *count*.
+
+### A second-order consequence
+
+`docs/rate-limits.md` budgets against successes:
+
+```promql
+increase(webhook_zone_writes_total{result="ok"}[24h]) > 250
+```
+
+deSEC's throttle counts *requests* — DRF records the hit before the view runs — so a rejected write
+spends a slot in `dns_api_per_domain_expensive` just as a successful one does. A zone burning its
+300 a day on writes deSEC keeps rejecting reads as `0` on that query, right up to the point where
+it starts getting 429s instead.
+
+### Where we stand
+
+Mechanically small: give `Applier` the metrics handle, call `record_desec_error(op::WRITE, &error)`
+in `write_zone` before `classify` flattens it, and let `record_write` see failures so
+`result="throttled"` and `result="error"` stop being labels that only tests produce. The cost is
+one dependency edge into `apply.rs`. The alternative — widening `ApplyOutcome` to carry the
+`desec::Error` — keeps the edge out but leaks the client's error type through the module boundary
+the `WebhookError` conversion exists to close.
+
+______________________________________________________________________
+
+## 13. A throttle never says how long, anywhere an operator will look
+
+### The mechanism
+
+`desec::Error::RateLimited`:
+
+```rust
+#[error("still rate limited after {attempts} attempts")]
+RateLimited {
+    attempts: u32,
+    retry_after: Option<Duration>,
+    #[source] body: ApiError,
+},
+```
+
+`retry_after` appears in no format string, and `body` is a `#[source]`, so it is not in `Display`
+either. `apply.rs` logs `error = %error`, which therefore renders as *"still rate limited after 1
+attempts"* and nothing else. The read path is quieter still:
+
+```rust
+if error.is_rate_limited() {
+    tracing::warn!(zone = %name, "throttled while re-reading zones; publishing what was read");
+    break;
+}
+```
+
+— no error, no duration. Meanwhile deSEC's own body, sitting unread in `RateLimited::body`, says
+`{"detail": "Request was throttled. Expected available in 45000 seconds."}`.
+
+### Why it matters
+
+This is the Go finding in a different mechanism. There:
+
+> Without a logger `retryablehttp` swallows the 429 and its retry wait, which is how the ~12.5h
+> sleep was invisible in the logs.
+
+Nothing hangs here — that is what §1 is for — so the consequence is smaller. But the number that
+tells an operator whether they are thirty seconds or twelve hours from working is equally absent,
+and it is the first thing anyone will want. The `Retry-After` does reach external-dns as a response
+header, where nobody reads it, and reaches `/metrics` as nothing at all.
+
+### Where we stand
+
+Two `tracing` fields in this crate, and arguably one line upstream to put `retry_after` into
+`RateLimited`'s `Display` — which would fix it for every consumer of the crate rather than this
+one.
+
+______________________________________________________________________
+
+## 14. The documented way to turn on debug logging turns off the interesting logs
+
+### The mechanism
+
+`docs/deployment.md`'s migration table and the README both give:
+
+| Old | New | Note |
+| --- | --- | --- |
+| `WEBHOOK_LOGLEVEL` | `RUST_LOG` | e.g. `external_dns_desec_webhook=debug` |
+
+One directive, with a target. The default it replaces has two:
+
+```rust
+EnvFilter::new("external_dns_desec_webhook=info,warn")
+```
+
+— this crate at info, **and a bare `warn` covering everything else**. Setting the documented value
+drops that second directive, so nothing from any other target is admitted below `ERROR` — which is
+every diagnostic the other crates emit. Turning on debug logging therefore silences:
+
+| Event | Target | Level |
+| --- | --- | --- |
+| `"giving up on a throttled request"` | `desec::client` | `WARN` |
+| `"local rate limit reached, waiting"` | `desec::ratelimit` | `DEBUG` |
+| the per-request span and `"response"` | `desec::client` | `DEBUG` |
+
+The first is the only line that says a 429 ended a request. The second is the only evidence the
+limiter is pacing us at all. None of the three is under `external_dns_desec_webhook`, and all three
+are what you reached for debug logging to see.
+
+### The request log that is not there either
+
+`TraceLayer::new_for_http()` puts its span, its on-request event and its on-response event at
+`DEBUG` under `tower_http::trace`, which the bare `warn` never admits. The only thing the layer
+contributes at the default level is `DefaultOnFailure`'s `ERROR` line on a 5xx — emitted inside a
+span that is itself disabled, so it names neither the path nor the duration.
+
+That means there is no *"started"* / *"completed"* pair. The Go provider had exactly this hole and
+closed it, in `internal/server/log.go`:
+
+> A private `logrus.New()` here silently discards the start/completion lines (they were logged
+> below the default level and to a separate sink), which hid that a `/records` handler had started
+> but never completed during the deSEC throttle hang.
+
+The consequence differs: there the missing line hid a hang, and here the handlers are bounded, so
+it hides only latency. But the apply histogram loses its worst samples too (§15), so latency is not
+recoverable from metrics either.
+
+### What actually works
+
+```
+RUST_LOG=external_dns_desec_webhook=debug,desec=debug,tower_http=debug,warn
+```
+
+which nobody is going to guess, and which the docs do not say.
+
+### Where we stand
+
+Either document the long form, or add a `--log-level` that composes the filter and leaves
+`RUST_LOG` as the escape hatch for people who want the firehose. The second is what
+`WEBHOOK_LOGLEVEL` was, and what the migration table implicitly promises an equivalent of.
+
+______________________________________________________________________
+
+## 15. The nine-second budget does not start when the request does
+
+**This corrects the diagram at the top of `apply.rs`.**
+
+### The mechanism
+
+That diagram says 15s client, 12s router layer, 9s handler deadline, 4s per attempt. Two waits sit
+outside it.
+
+**The gate.**
+
+```rust
+pub async fn apply(&self, changes: &Changes) -> ApplyOutcome {
+    let _gate = self.gate.lock().await;                    // unbounded
+    ...
+    let timed_out = tokio::time::timeout(DEADLINE, self.write_all(...)).await.is_err();
+```
+
+The clock starts *after* the mutex is acquired. If external-dns overlaps two reconciles — which is
+the only reason the gate exists — the second request waits an unmetered amount of time and then
+grants itself a fresh nine seconds. Only the router's 12s layer bounds the total, and when that
+fires the client gets the generic remapped 503 rather than the composed one with a real
+`Retry-After`.
+
+**The pacing wait.** `desec::Client`'s `timeout(4s)` is set on the `reqwest` client, so it covers
+`send()` and the body read. `Limiter::acquire` runs before that, inside the same `execute` call,
+and may sleep up to `max_rate_limit_wait`. The innermost bound is 2 + 4 = **6 seconds**, not 4.
+
+In practice the 2s is only ever spent after a throttle: one bulk `PATCH` per zone per gated apply
+never fills a `2/s` per-domain window, and eight concurrent zones do not trouble `user`'s
+`2000/day`. So the pacing wait is reachable exactly when a penalty is live, which is exactly when
+the handler is already slow. CodeRabbit raised the same arithmetic against the Go transport, where
+it was worse — there the sleep was *inside* `http.Client.Timeout` and ate the budget rather than
+extending it.
+
+### The part that costs something
+
+When the 12s layer fires, or external-dns hangs up, or the pod drains, the whole `apply` future is
+dropped. `write_all`'s `JoinSet` goes with it, aborting the in-flight `PATCH`es, and:
+
+- the `Arc<Mutex<Vec<_>>>` of per-zone outcomes is dropped, so which zones succeeded is unknown;
+- `store.invalidate` is never called for the zones that were attempted;
+- nothing is recorded — including `apply_duration_seconds`, whose stated purpose is that "a
+  near-miss on the 15s client timeout is visible before it becomes an outage". The samples it
+  loses are precisely the near-misses.
+
+The snapshot damage is self-healing, which is worth stating because it bounds how much this
+matters: a `PATCH` that landed moves the zone's `touched`, and `needs_relist` compares
+server-supplied values, so the next tick re-reads the zone whether or not we invalidated it. What
+does not heal is the metric. What is merely wasteful is a duplicate write, if external-dns replans
+before the next tick.
+
+### Where we stand
+
+Fixing the gate ordering is two lines — start the clock at handler entry, or wrap the acquire in
+the deadline — and it makes the diagram true rather than aspirational. Whether the dropped-future
+case deserves defending is a genuine question: a `Drop` guard or a detached recorder is more
+machinery than a self-healing failure justifies, and the honest answer may be to amend the comment
+instead.
+
+______________________________________________________________________
+
+## 16. `snapshot_age_seconds` measures the zone list, not the records
+
+### The mechanism
+
+`store::publish`:
+
+```rust
+last_full_ok: if update.zone_list_ok { Some(Instant::now()) } else { current.last_full_ok },
+```
+
+and `zone_list_ok` is true whenever `GET /domains/` succeeded. `refresh.rs` sets it before reading
+a single RRset, and its own test pins that it survives a mid-tick throttle:
+
+```rust
+// The zone list itself succeeded, so nothing is removed.
+assert!(update.zone_list_ok);
+assert!(update.error.is_some());
+```
+
+That is right for what the flag is *for*: a failed list is not evidence a zone has gone away (§7).
+The problem is that `last_full_ok` is then reused as the snapshot's **age**, and age is what
+`/readyz`, `webhook_snapshot_age_seconds` and the `age_s` field on the `/records` log line all
+report.
+
+So a webhook that lists zones happily every 180 seconds and has been throttled out of every RRset
+read for six hours reports an age of a couple of minutes and answers `/readyz: ready`. The records
+it is serving are six hours old. Per-zone truth exists — `Zone::listed_at`, which
+`Zone::is_stale` already uses to schedule forced re-reads — and nothing surfaces it.
+
+### The staleness question underneath
+
+The Go provider capped staleness at 24 hours:
+
+```go
+// maxCacheStaleness caps how old a last-known-good record set may be before it is no longer
+// served during a throttle window. Past it we prefer a 500 (retried next interval) over
+// feeding external-dns a stale zone under --policy=sync, which could delete records that in
+// fact still exist.
+```
+
+Here there is no cap at all. §7 states the position — "a *stale* snapshot → `200` with stale data,
+because old truth beats no truth" — and it is stronger than the Go comment's fear, because §7 also
+establishes that reported-but-absent records cannot cause a deletion the owner filter would not
+already stop, and because `plan::build` suppresses deletes for RRsets the snapshot does not hold.
+
+What a stale snapshot *can* do is the opposite of deletion. A record created out of band while we
+were blind — cert-manager's ACME TXT, a hand-edited MX — is missing from what we report, so
+external-dns takes the `len(row.current) == 0` branch, plans a Create, and we write over it. That
+is a real overwrite rather than a phantom one, and its likelihood grows with age.
+
+The author of the Go patch had arrived at the same doubt from the other direction, in [pr2]:
+
+> I'm wondering if the 24h maxCacheStaleness should be configurable and default closer to the
+> throttle window.
+
+### Where we stand
+
+Two separable things, and only the first is clearly worth doing.
+
+1. **Report the right age.** `max(zone.listed_at.elapsed())` across the snapshot, exposed
+   *alongside* the zone-list age rather than instead of it — the two mean different things and
+   both are diagnostic. This costs nothing and makes the existing readiness bound honest, which is
+   a precondition for arguing about the second point at all.
+1. **Cap the age.** Refusing to serve past a bound trades a known-wrong answer for a `503`, and
+   §7's argument is that the known-wrong answer is usually the better one. If it is ever added it
+   should be a flag defaulting to *off* rather than a constant, and it should be per-zone rather
+   than all-or-nothing — the Go version's all-or-nothing rule exists because it had no zone-level
+   model, and this one does.
+
+______________________________________________________________________
+
+## 17. §4 claims a debug body dump that does not exist
+
+**This corrects §4.**
+
+Among the benefits §4 lists for reading the request body as bytes:
+
+> gives us the debug body dump the Go provider had to bolt on separately
+
+It does not. `router::apply_changes` reads the bytes, deserializes them, and drops them:
+
+```rust
+let body = read_body(request, state.max_body_bytes).await?;
+let changes: Changes = serde_json::from_slice(&body)...
+```
+
+Nothing logs `body`. Reading as bytes *makes a dump possible* — the Go provider had to buffer and
+rewind `r.Body` to get one — but the two lines were never written.
+
+What the Go version dumped is worth keeping in mind, because the gap it filled is still open here.
+Its commit exists to explain a live cluster logging `0 creates, 10 updates, 0 deletes` every
+minute, and the fields that explained it — `UpdateOld`, `labels`, `providerSpecific` — are exactly
+the ones no summary line shows. This provider's `changes_suppressed_total{reason="identical"}`
+answers *how many* of those updates were spurious without answering *why*, so the diagnostic
+question is the same one.
+
+CodeRabbit's note on that commit applies to any version of it: bound what gets logged. A large
+cluster's change set runs to megabytes, and one log line that size is its own incident.
+
+______________________________________________________________________
+
+## 18. Per-domain in-flight dedup solves a problem this design does not have
+
+[pr2] adds a `fetchTracker`: a per-domain set of in-flight fetches, where a second concurrent fetch
+for the same domain short-circuits to `FetchInProgressError` rather than going on the wire.
+
+### Why the mechanism is moot here
+
+There is only ever one fetcher. `GET /records` is served from the snapshot and touches no socket.
+The only code that lists RRsets is `Refresher::tick`, which is one task, iterates zones
+**sequentially** with a comment saying why, and caps itself at `MAX_RELISTS_PER_TICK`. Two fetches
+of the same zone cannot overlap because no two fetches can overlap. On the write side
+`Applier::gate` serializes applies outright.
+
+A dedup map here would guard against a concurrency the architecture forbids, and would then be the
+only thing stopping a future contributor from noticing they had introduced one.
+
+### The part that is not moot
+
+Note the "4 clusters" in the PR's own description. In-process dedup does not touch that, and its
+author says so:
+
+> limited per process, does not transcend clusters, although I would probably not share a DNS zone
+> between clusters
+
+Four processes sharing a token is §11's case: each paces itself against limits that describe the
+account, each believes it may spend the whole allowance, and the account is throttled while every
+participant is individually well-behaved. This provider's answer is manual partitioning —
+`--rate-limit dns_api_cheap=12/s,12/min` — which `docs/rate-limits.md` documents for the
+cert-manager case but not for the multi-cluster one, even though the arithmetic is the same and the
+multi-cluster reader is the one who has to do it in their head.
+
+### Where we stand
+
+The dedup feature: no, and the reason recorded here so it does not get re-proposed. The
+account-sharing problem: unsolved, and probably correctly unsolved — a shared limiter behind a
+lease, or a leader among replicas, is a distributed-systems dependency for a webhook that
+otherwise has none. What it does deserve is a paragraph in `rate-limits.md` addressed to the reader
+running more than one cluster off one token.
+
+______________________________________________________________________
+
+## 19. The rest of the correlation
+
+Everything else from [pr26] and its review, checked against this codebase and closed. Recorded
+because "we looked and it was already handled" is only useful if it is written down.
+
+| From the Go fork | Status here |
+| --- | --- |
+| One atomic bulk write per domain, so a retype is not two rejected requests | `plan::build` emits one `ZonePlan` per zone; `a_record_type_change_becomes_one_atomic_request` |
+| Strip the trailing dot from the reported `dnsName` | `convert::canonical_name`; `reported_dns_names_never_carry_a_trailing_dot` |
+| Bump `nrdcg/desec` for the apex `subname,omitempty` bug | pinned against `desec-rs` by `a_change_to_the_apex_addresses_the_empty_subname` |
+| A throttle must become a soft error, never a 429 | §5; `every_variant_maps_to_a_status_external_dns_retries` |
+| Serve cached records during a throttle window | the premise rather than a fallback — reads never call the API |
+| Thread the request context so a hung call can be cancelled | no call to hang: §1 removes the retry sleep, and `apply` bounds itself |
+| **Review:** invalidate the cache after a successful write | `store::apply_confirmed` folds in the *response* and sets `touched: None`, which is more than the review asked for |
+| **Review:** probe and commit are not serialized, so two callers can both pass a full window | does not reproduce — `Limiter::acquire` probes and claims under one lock hold, and `a_refused_acquire_claims_nothing` pins that a blocked request claims nothing |
+| **Review:** the proactive sleep is inside the HTTP client's timeout | does not reproduce — `reqwest`'s `timeout` covers only `send()`, so the limiter wait is additive; that is its own arithmetic, in §15 |
+| **Review:** `Retry-After` truncates to `0` for a sub-second window | `RETRY_AFTER_BOUNDS = (1, 3600)`; `retry_after_is_clamped_into_range` |
+| **Review:** `Retry-After` may be an HTTP-date | `Res::retry_after` parses both forms and clamps to `MAX_RETRY_AFTER` |
+| **Review:** pin GitHub Actions to full-length SHAs | done throughout `.github/`, with version and date comments |
+| Log the throttle's `Retry-After` and deSEC's detail body | **open** — §13 |
+
+[pr2]: https://github.com/sshine/external-dns-desec-provider/pull/2
+[pr26]: https://github.com/michelangelomo/external-dns-desec-provider/pull/26
