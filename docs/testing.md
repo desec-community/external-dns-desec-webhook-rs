@@ -1,47 +1,32 @@
 # Testing
 
-Four layers, each answering a different question. The first three need no network and no
-cluster; the fourth needs a real deSEC account.
+This webhook has four layers of tests, one needing network access to a real deSEC account.
 
 ## 1. Unit and property tests
 
-`cargo test`. The four modules where every historical bug lived — `wire`, `convert`, `model`,
-`adjust` — have no internal dependencies, no async, and no mocking, so they are tested directly.
+`cargo test`. The four modules where every historical bug lived (`wire`, `convert`, `model`,
+`adjust`) have no internal dependencies, no async, and no mocking, so they are tested directly.
 
-Two property tests carry more weight than the rest put together:
-
-- `adjustment_is_idempotent` — `adjust(adjust(x)) == adjust(x)`
-- `adjusting_storing_and_reading_back_is_a_fixpoint` — what we normalize, store in deSEC's
-  representation, and read back is what we normalized
-
-If both hold, the no-op write loop is structurally impossible, which is a stronger statement
-than fixing each of the three bugs that caused one.
-
-## 2. Integration tests against a stateful deSEC
+## 2. Integration tests against a stateful deSEC mock
 
 `cargo test --test end_to_end`. The real router on a real socket, against an in-memory deSEC in
 `tests/common/mod.rs`.
 
-The mock is stateful on purpose, ported from the Go provider's `desecMock`. It enforces two
-rules that are about zone *state* rather than about individual requests:
+The stateful mock is ported from the Go provider's `desecMock`.
+
+It enforces two rules that are about zone state rather than about individual requests:
 
 - `POST /rrsets/` is create-only
 - a CNAME may not coexist with another type at the same subname
 
-That second rule is what makes `a_record_type_change_succeeds_as_a_single_request` meaningful.
-A matcher-based mock would have passed the buggy implementation, because the request it sent
-looked perfectly well-formed — it was the resulting zone state that deSEC rejected.
+The mock uses a real socket rather than a `tower::ServiceExt::oneshot`, because the `Content-Type`
+bytes and absence of a duplicate header are `hyper` serialization concerns that `oneshot` bypasses.
 
-A real socket rather than `tower::ServiceExt::oneshot`, because the two facts most worth
-pinning — the exact `Content-Type` bytes and the absence of a duplicate header — are hyper
-serialization concerns that `oneshot` bypasses.
-
-The refresh loop is not spawned in these tests. `Harness::reload()` drives one pass explicitly,
-so nothing depends on wall-clock timing and a failure is never a flake.
+Mock tests are deterministic and don't depend on wall-clock timing.
 
 ## 3. The offline lab: real external-dns, no cluster, no Docker
 
-This is the one worth understanding, because it is more achievable than it looks.
+<!-- TODO: Since the offline lab wasn't made yet, this needs to be revisited. -->
 
 **external-dns runs without Kubernetes.** `source/fake.go` says so in its own doc comment:
 it "provides dummy endpoints for testing/dry-running of dns providers without needing an
