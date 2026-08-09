@@ -23,20 +23,27 @@
 //!
 //! # deSEC rate limits, external-dns request budget
 //!
-//! deSEC caps RRset writes at 300 per day per domain and any authenticated request at
-//! 2000 per day for the whole account. external-dns reconciles every minute by default,
-//! which is 1440 cycles a day. A provider that writes once per cycle exhausts the write
-//! budget in 5 hours, and a provider that blocks while throttled runs past
-//! external-dns's 15-second client timeout and takes external-dns down with it.
+//! deSEC caps RRset writes at 300 per day per domain and any authenticated request at 2000
+//! per day for the whole account. external-dns reconciles every minute by default, which is
+//! 1440 cycles a day. With this default, a provider that writes once per cycle exhausts the
+//! write budget in 5 hours. A provider that blocks while throttled runs past external-dns's
+//! 15-second client timeout and takes external-dns down with it.
 //!
-//! Two properties follow from that, and everything else here is in service of them:
+//! This webhook makes some choices to avoid getting rate-limited:
 //!
-//! - **`/records` and `/adjustendpoints` never call deSEC.** They are served from a
-//!   snapshot that a background task refreshes on its own schedule, so they answer in
-//!   microseconds whatever the API is doing.
-//! - **A cycle with no real change makes no request.** TTLs are normalized against the
-//!   zone's own `minimum_ttl` before external-dns compares them, and any write that
-//!   would not change stored state is dropped.
+//! - **The webhook's `/records` and `/adjustendpoints` endpoints never call deSEC.** They are
+//!   served from a snapshot that a background task refreshes on its own schedule, so they
+//!   answer in microseconds whatever the API is doing.
+//! - **An external-dns cycle with no real change makes no request.** TTLs are normalized
+//!   against the zone's own `minimum_ttl` before external-dns compares them, and any write
+//!   that would not change stored state is dropped.
+//! - If the deSEC API throttles a request, the webhook leaves the API alone until the
+//!   `Retry-After` has elapsed, rather than poll the API on every external-dns cycle.
+//!
+//! For those reasons, **you can leave external-dns's `--interval` to whatever you like.** The
+//! webhook ensures that a low `--interval` does not exhaust the request budget. Instead, you
+//! can set the webhook property `--refresh-interval` (`WEBHOOK_REFRESH_INTERVAL`); the webhook
+//! reports what this will cost at startup.
 //!
 //! # Configuration
 //!
@@ -53,6 +60,7 @@
 //! | `WEBHOOK_ADMIN_LISTEN` | `--admin-listen` | `0.0.0.0:8080` | health and metrics |
 //! | `WEBHOOK_REFRESH_INTERVAL` | `--refresh-interval` | `180s` | independent of `--interval` |
 //! | `WEBHOOK_MAX_ZONE_AGE` | `--max-zone-age` | `6h` | forced re-list backstop |
+//! | `WEBHOOK_MAX_THROTTLE_COOLDOWN` | `--max-throttle-cooldown` | `1h` | `0` disables |
 //! | `WEBHOOK_DRY_RUN` | `--dry-run` | `false` | |
 //! | `WEBHOOK_ALLOW_EMPTY_ZONE_SET` | `--allow-empty-zone-set` | `false` | see below |
 //! | `WEBHOOK_METRICS_ZONE_LABELS` | `--metrics-zone-labels` | `false` | |

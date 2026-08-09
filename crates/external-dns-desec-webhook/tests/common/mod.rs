@@ -371,7 +371,12 @@ impl Harness {
 
         let app = router::router(router::AppState {
             store: store.clone(),
-            applier: Arc::new(Applier::new(client, store.clone(), false)),
+            applier: Arc::new(Applier::new(
+                client,
+                store.clone(),
+                false,
+                Duration::from_secs(3600),
+            )),
             metrics,
             filter: DomainFilter::include(owned),
             allow_empty_zone_set: false,

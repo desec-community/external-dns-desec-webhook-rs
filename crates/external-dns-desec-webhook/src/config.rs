@@ -69,6 +69,20 @@ pub struct Config {
     #[arg(long, env = "WEBHOOK_MAX_ZONE_AGE", default_value = "6h", value_parser = humantime::parse_duration)]
     pub max_zone_age: Duration,
 
+    /// Longest to believe a deSEC throttle before spending a request to re-check.
+    ///
+    /// Really a probe interval. deSEC can name a wait of many hours, and external-dns
+    /// reads only the status code of our answer, so it comes back every --interval
+    /// regardless; without this, every one of those cycles spends a write that can only be
+    /// refused. At the default, a zone deSEC says to leave alone for twelve hours is asked
+    /// again once an hour rather than sixty times.
+    ///
+    /// Zero disables it, which restores sending requests deSEC has already said it will
+    /// refuse. An hour matches the ceiling we clamp our own Retry-After to, so the wait we
+    /// hold and the wait we advertise are one number.
+    #[arg(long, env = "WEBHOOK_MAX_THROTTLE_COOLDOWN", default_value = "1h", value_parser = humantime::parse_duration)]
+    pub max_throttle_cooldown: Duration,
+
     /// Log the writes that would be made, without making them.
     #[arg(long, env = "WEBHOOK_DRY_RUN")]
     pub dry_run: bool,
@@ -271,6 +285,30 @@ mod tests {
 
     fn minimal() -> Config {
         config(&["--api-token", "t", "--domain-filter", "example.com"])
+    }
+
+    /// The default is an hour rather than the limiter's two seconds, which is the whole
+    /// point of the flag existing; and zero has to stay reachable, because it is the only
+    /// way back to the old behaviour if the cooldown ever misbehaves.
+    #[test]
+    fn the_throttle_cooldown_defaults_to_an_hour_and_can_be_turned_off() {
+        assert_eq!(
+            minimal().max_throttle_cooldown,
+            Duration::from_secs(3600),
+            "matches the ceiling error.rs clamps our own Retry-After to"
+        );
+        assert_eq!(
+            config(&[
+                "--api-token",
+                "t",
+                "--domain-filter",
+                "example.com",
+                "--max-throttle-cooldown",
+                "0s",
+            ])
+            .max_throttle_cooldown,
+            Duration::ZERO
+        );
     }
 
     #[test]

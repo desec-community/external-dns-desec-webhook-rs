@@ -48,6 +48,26 @@ in a day. If you are approaching it, `webhook_zone_writes_total` with
 increase(webhook_zone_writes_total{result="ok"}[24h]) > 250
 ```
 
+### When a write is refused
+
+deSEC counts a request before it runs the view, so a rejected write spends a slot just as a
+successful one does. That matters because external-dns reads only the status code of our answer:
+it comes back every `--interval` whatever `Retry-After` we sent, and a zone that earned a 429
+would earn another one every cycle — sixty an hour against a budget of three hundred a day, each
+one deepening the hole.
+
+So a zone deSEC refuses is left alone until the wait it named elapses, up to
+`--max-throttle-cooldown` (1h). external-dns sees the same `503` it would have seen anyway; the
+worst case at deSEC drops from one request per zone per `--interval` to one per zone per hour.
+
+The cap is really a probe interval. deSEC can name a wait of twelve hours, and honouring that
+literally would leave a zone unwritable for a working day on the strength of one response; at an
+hour we spend one request an hour finding out whether it still means it. Setting it to `0` turns
+the cooldown off, which restores sending writes deSEC has already said it will refuse.
+
+Like the limiter's sliding windows, this lives only in memory. A restart now discards two kinds
+of throttle memory rather than one.
+
 ## Reading the metrics
 
 The two that matter:
@@ -64,6 +84,21 @@ only two causes worth considering:
 
 - something else shares the account — cert-manager's deSEC solver, `dnscontrol`, the web UI. The
   documented rates are the *account's* budget, not ours. Give the webhook a share with
-  `--rate-limit dns_api_per_domain_expensive=1/s,7/min`.
+  `--rate-limit dns_api_per_domain_expensive=1/s,7/min`. The same arithmetic applies to more than
+  one cluster on one token, which is the case people hit without expecting to: each process paces
+  itself correctly against limits that describe the account, and between them they overspend it.
 - the process restarted and lost its in-memory windows. This is also why `/healthz` ignores deSEC
   entirely: restarting a throttled webhook makes the throttling worse, not better.
+
+**`webhook_zone_writes_total{result="cooling_down"}`** is a write we declined to make, and it is
+the one outcome here with no other trace: no request, so nothing reaches
+`webhook_desec_requests_total`, and a `503` indistinguishable from any other in
+`webhook_soft_errors_total`. If DNS is not updating and nothing appears to be failing, this is
+where to look.
+
+```promql
+rate(webhook_zone_writes_total{result="cooling_down"}[5m]) > 0
+```
+
+A related tell: `webhook_apply_duration_seconds{reason="error"}` that is *fast* is a cooldown,
+because no request was made. A slow one is a real failure.

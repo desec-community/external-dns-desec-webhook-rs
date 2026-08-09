@@ -73,6 +73,9 @@ pub struct WriteLabels {
     /// sees the 300-writes-a-day cap approaching, but it is cardinality an operator should
     /// opt into.
     pub zone: String,
+    /// `ok`, or `cooling_down` for a write we declined to make because deSEC threw a 429 at
+    /// this zone recently. Deliberately not `throttled`, which already means deSEC answered
+    /// 429, nor `would_block`, which already means our own limiter declined.
     pub result: &'static str,
 }
 
