@@ -58,6 +58,16 @@ pub struct ZonePlan {
     /// Tracked separately because deSEC may echo a deletion as `records: []` or omit it
     /// from the response entirely, and the snapshot update has to work either way.
     pub deleted: Vec<RrKey>,
+
+    /// The value each patch asks deSEC to store.
+    ///
+    /// Kept alongside the patches because `BulkPatch` does not hand its records back, and
+    /// because the comparison this exists for needs the same sorted, deduplicated form the
+    /// snapshot holds. deSEC canonicalizes record values on storage per type, and any axis
+    /// it rewrites that `convert::records_for` does not reproduce makes the next cycle's
+    /// comparison differ again — a write that repeats forever. `apply` diffs this against
+    /// what comes back, so that becomes visible instead of silent.
+    pub written: Vec<(RrKey, RrValue)>,
 }
 
 #[derive(Debug, Default)]
@@ -147,7 +157,9 @@ pub fn build(changes: &Changes, zones: &ZoneIndex) -> Plan {
         let patch = BulkPatch::new(key.subname.clone(), key.record_type.clone())
             .ttl(value.ttl)
             .records(value.records().to_vec());
-        entry_for(&mut by_zone, zone).patches.push(patch);
+        let plan = entry_for(&mut by_zone, zone);
+        plan.patches.push(patch);
+        plan.written.push((key.clone(), value));
     }
 
     for (zone_name, key) in &deletes {
@@ -182,6 +194,7 @@ fn entry_for<'a>(by_zone: &'a mut HashMap<String, ZonePlan>, zone: &Zone) -> &'a
             zone: zone.name.clone(),
             patches: Vec::new(),
             deleted: Vec::new(),
+            written: Vec::new(),
         })
 }
 

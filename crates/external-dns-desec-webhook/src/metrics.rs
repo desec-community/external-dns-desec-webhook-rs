@@ -66,6 +66,16 @@ pub mod outcome {
     pub const ERROR: &str = "error";
 }
 
+/// The record type of an RRset deSEC rewrote on storage.
+///
+/// An owned `String` rather than the `&'static str` the other label sets use, because
+/// `RecordType::Other` carries a mnemonic this build has never heard of. Cardinality is
+/// bounded by the number of DNS record types, so it is safe to label on unconditionally.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RecordTypeLabel {
+    pub record_type: String,
+}
+
 /// A write's fate, per zone.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct WriteLabels {
@@ -86,6 +96,7 @@ pub struct Metrics {
     pub changes_suppressed: Family<ReasonLabel, Counter>,
     pub adjust_mutations: Family<KindLabel, Counter>,
     pub zone_writes: Family<WriteLabels, Counter>,
+    pub write_normalized: Family<RecordTypeLabel, Counter>,
     pub desec_requests: Family<RequestLabels, Counter>,
     pub refresh_zone_skipped: Family<ReasonLabel, Counter>,
     pub refresh_failures: Family<KindLabel, Counter>,
@@ -128,6 +139,16 @@ impl Metrics {
             "zone_writes",
             "Bulk RRset writes attempted, by zone and result",
             zone_writes.clone(),
+        );
+
+        // Expected to stay at zero. Anything else means deSEC stores a value in a form we
+        // did not send, so next cycle's comparison differs again and the write repeats. The
+        // label says which record type to look at.
+        let write_normalized = Family::<RecordTypeLabel, Counter>::default();
+        registry.register(
+            "write_normalized",
+            "RRsets deSEC rewrote on storage, by record type",
+            write_normalized.clone(),
         );
 
         let desec_requests = Family::<RequestLabels, Counter>::default();
@@ -232,6 +253,7 @@ impl Metrics {
             changes_suppressed,
             adjust_mutations,
             zone_writes,
+            write_normalized,
             desec_requests,
             refresh_zone_skipped,
             refresh_failures,
@@ -268,6 +290,30 @@ impl Metrics {
             #[allow(clippy::cast_precision_loss)]
             self.rrsets_per_write.observe(rrsets as f64);
         }
+    }
+
+    /// Count and describe an RRset deSEC stored in a form other than the one we sent.
+    ///
+    /// Logged at info rather than warn: nothing is broken at the moment it happens, and one
+    /// line per occurrence is affordable precisely because it should not recur. If it does
+    /// recur every cycle, that repetition is the finding.
+    pub fn record_normalized(&self, normalized: &crate::apply::Normalized) {
+        self.write_normalized
+            .get_or_create(&RecordTypeLabel {
+                record_type: normalized.key.record_type.as_str().to_owned(),
+            })
+            .inc();
+        tracing::info!(
+            zone = %normalized.zone,
+            subname = %normalized.key.subname.as_payload(),
+            record_type = %normalized.key.record_type.as_str(),
+            sent = ?normalized.sent.records(),
+            sent_ttl = normalized.sent.ttl,
+            stored = ?normalized.stored.records(),
+            stored_ttl = normalized.stored.ttl,
+            "deSEC stored this RRset in a different form than we sent; the next cycle will \
+             compare against the stored form and plan the same write again"
+        );
     }
 
     /// Classify a deSEC failure the same way the HTTP layer does, so the two agree.
@@ -444,6 +490,30 @@ mod tests {
         // means deSEC pushed back and something is unaccounted for.
         assert!(rendered.contains(r#"outcome="would_block""#), "{rendered}");
         assert!(!rendered.contains(r#"outcome="throttled""#));
+    }
+
+    /// The label is what tells an operator which record type to look at, so it has to reach
+    /// the wire as the mnemonic rather than as anything Rust-shaped.
+    #[tokio::test]
+    async fn a_rewritten_value_names_its_record_type_on_the_wire() {
+        let metrics = metrics();
+        metrics.record_normalized(&crate::apply::Normalized {
+            zone: "example.com".to_owned(),
+            key: crate::model::RrKey::new(
+                "v6".parse().expect("valid subname"),
+                desec::RecordType::AAAA,
+            ),
+            sent: crate::model::RrValue::new(["2001:0DB8::0001".to_owned()], 3600),
+            stored: crate::model::RrValue::new(["2001:db8::1".to_owned()], 3600),
+        });
+
+        let rendered = metrics
+            .encode(&SnapshotStore::new(), false)
+            .expect("encodes");
+        assert!(
+            rendered.contains(r#"webhook_write_normalized_total{record_type="AAAA"} 1"#),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

@@ -31,12 +31,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use desec::api::rrsets::BulkPatch;
+use desec::api::rrsets::{BulkPatch, Rrset};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::error::{WebhookError, classify};
-use crate::model::RrKey;
+use crate::model::{RrKey, RrValue};
 use crate::plan::{self, ZonePlan};
 use crate::store::SnapshotStore;
 use crate::wire::Changes;
@@ -113,6 +113,23 @@ impl Cooldown {
     }
 }
 
+/// An RRset deSEC stored in a different form from the one we sent.
+///
+/// deSEC canonicalizes record values on storage, per type, and documents only that it does
+/// so — not which types or into what. `convert::records_for` reproduces two axes of it,
+/// embedded domain names and TXT quoting. Anywhere else, the value we compare against next
+/// cycle is not the value we asked for, so the comparison differs again and we write again.
+///
+/// Reported rather than corrected. Knowing which types this happens to is what decides
+/// whether the answer is to canonicalize ourselves or to remember what we wrote.
+#[derive(Debug, Clone)]
+pub struct Normalized {
+    pub zone: String,
+    pub key: RrKey,
+    pub sent: RrValue,
+    pub stored: RrValue,
+}
+
 #[derive(Debug, Default)]
 pub struct ApplyReport {
     /// Changes that became no requests, by reason.
@@ -122,6 +139,8 @@ pub struct ApplyReport {
     /// Zones left alone because deSEC refused them recently, and how long is left. No
     /// request was made for any of these.
     pub cooling_down: Vec<(String, Duration)>,
+    /// RRsets deSEC rewrote on the way in. Empty is the expected state.
+    pub normalized: Vec<Normalized>,
     pub zones_failed: usize,
     /// True when our own deadline fired rather than a request failing.
     pub timed_out: bool,
@@ -133,9 +152,18 @@ impl ApplyReport {
     }
 }
 
+/// What one zone's write achieved.
+#[derive(Debug)]
+struct ZoneWrite {
+    /// RRsets the single request carried.
+    rrsets: usize,
+    /// Those deSEC stored in some other form. Normally empty.
+    normalized: Vec<Normalized>,
+}
+
 /// Per-zone outcomes, collected by the tasks themselves so a fired deadline cannot discard
 /// the knowledge of which zones already succeeded.
-type ZoneResults = Arc<Mutex<Vec<(String, Result<usize, WebhookError>)>>>;
+type ZoneResults = Arc<Mutex<Vec<(String, Result<ZoneWrite, WebhookError>)>>>;
 
 /// The outcome of an apply, carrying both what to report to external-dns and what to
 /// record as metrics — the two are needed on both the success and failure paths.
@@ -272,7 +300,10 @@ impl Applier {
         let finished = std::mem::take(&mut *results.lock().expect("results mutex"));
         for (zone, outcome) in finished {
             match outcome {
-                Ok(rrsets) => report.written.push((zone, rrsets)),
+                Ok(write) => {
+                    report.written.push((zone, write.rrsets));
+                    report.normalized.extend(write.normalized);
+                }
                 Err(reported) => {
                     report.zones_failed += 1;
                     // Prefer a throttle over a rejection when reporting: it tells
@@ -355,7 +386,7 @@ async fn write_zone(
     store: &SnapshotStore,
     cooldown: &Cooldown,
     plan: &ZonePlan,
-) -> Result<usize, WebhookError> {
+) -> Result<ZoneWrite, WebhookError> {
     let rrsets = plan.patches.len();
     tracing::debug!(zone = %plan.zone, rrsets, "writing");
 
@@ -363,10 +394,11 @@ async fn write_zone(
         Ok(confirmed) => {
             // Whatever deSEC said before, it is writing now.
             cooldown.clear(&plan.zone);
+            let normalized = normalizations(&plan.zone, &plan.written, &confirmed);
             store
                 .apply_confirmed(&plan.zone, &confirmed, &plan.deleted)
                 .await;
-            Ok(rrsets)
+            Ok(ZoneWrite { rrsets, normalized })
         }
         Err(error) => {
             let reported = classify(&error);
@@ -409,6 +441,31 @@ async fn write_zone(
             Err(reported)
         }
     }
+}
+
+/// The RRsets deSEC stored in some other form than the one we sent.
+///
+/// The comparison is against the *response*, not against a later read, so it costs nothing:
+/// `apply_confirmed` already folds that response into the snapshot for the same reason, that
+/// the server's own answer is the only reliable account of what it did.
+///
+/// An RRset missing from the response is not reported. deSEC returns what a bulk `PATCH`
+/// affected, and a value it chose not to echo is not evidence of anything either way.
+fn normalizations(zone: &str, sent: &[(RrKey, RrValue)], confirmed: &[Rrset]) -> Vec<Normalized> {
+    sent.iter()
+        .filter_map(|(key, sent)| {
+            let stored = confirmed
+                .iter()
+                .find(|rrset| RrKey::of(rrset) == *key)
+                .map(RrValue::of)?;
+            (stored != *sent).then(|| Normalized {
+                zone: zone.to_owned(),
+                key: key.clone(),
+                sent: sent.clone(),
+                stored,
+            })
+        })
+        .collect()
 }
 
 /// The RRsets a request addressed, for a log line that can be matched against deSEC's
@@ -1005,6 +1062,81 @@ mod tests {
         let zone = snapshot.zones.get("example.com").expect("present");
         assert_eq!(zone.rrsets.len(), 1);
         assert_eq!(zone.write_epoch, 1);
+    }
+
+    /// Answers a `PATCH` with one AAAA RRset holding `stored`, whatever was sent.
+    async fn echoing(server: &MockServer, stored: &str) {
+        Mock::given(method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "domain": "example.com",
+                    "subname": "v6",
+                    "type": "AAAA",
+                    "name": "v6.example.com.",
+                    "records": [stored],
+                    "ttl": 3600,
+                    "created": "2026-01-01T00:00:00Z",
+                    "touched": "2026-01-01T00:00:00Z",
+                }])),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// deSEC canonicalizes record values on storage and documents only that it does, not
+    /// which types or into what. Where `records_for` does not reproduce the rewrite, the
+    /// value we compare against next cycle is not the one we asked for, so the same write
+    /// is planned again, forever.
+    ///
+    /// `2001:0DB8::0001` and `2001:db8::1` are the same address, which is precisely why a
+    /// difference like this is easy to ship and hard to notice.
+    #[tokio::test]
+    async fn a_value_desec_rewrites_on_storage_is_reported() {
+        let server = MockServer::start().await;
+        echoing(&server, "2001:db8::1").await;
+
+        let store = store_with(&[]).await;
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
+
+        let outcome = applier
+            .apply(&Changes {
+                create: vec![endpoint("v6.example.com", "AAAA", &["2001:0DB8::0001"])],
+                ..Changes::default()
+            })
+            .await;
+
+        assert!(outcome.error.is_none());
+        let normalized = &outcome.report.normalized;
+        assert_eq!(normalized.len(), 1, "{normalized:?}");
+        assert_eq!(normalized[0].zone, "example.com");
+        assert_eq!(normalized[0].key.record_type.as_str(), "AAAA");
+        assert_eq!(normalized[0].sent.records(), ["2001:0DB8::0001".to_owned()]);
+        assert_eq!(normalized[0].stored.records(), ["2001:db8::1".to_owned()]);
+    }
+
+    /// The other half, and the one that keeps the signal worth alerting on: a write deSEC
+    /// stores as sent must report nothing at all.
+    #[tokio::test]
+    async fn a_value_stored_as_sent_is_not_reported() {
+        let server = MockServer::start().await;
+        echoing(&server, "2001:0DB8::0001").await;
+
+        let store = store_with(&[]).await;
+        let applier = Applier::new(client(&server), store, false, COOLDOWN);
+
+        let outcome = applier
+            .apply(&Changes {
+                create: vec![endpoint("v6.example.com", "AAAA", &["2001:0DB8::0001"])],
+                ..Changes::default()
+            })
+            .await;
+
+        assert!(outcome.error.is_none());
+        assert!(
+            outcome.report.normalized.is_empty(),
+            "{:?}",
+            outcome.report.normalized
+        );
     }
 
     #[tokio::test]

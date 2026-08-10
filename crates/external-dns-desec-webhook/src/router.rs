@@ -185,6 +185,9 @@ async fn apply_changes(
     for (zone, _) in &outcome.report.cooling_down {
         state.metrics.record_write(zone, "cooling_down", 0);
     }
+    for normalized in &outcome.report.normalized {
+        state.metrics.record_normalized(normalized);
+    }
     let result = if outcome.report.timed_out {
         "timeout"
     } else if outcome.error.is_some() {
