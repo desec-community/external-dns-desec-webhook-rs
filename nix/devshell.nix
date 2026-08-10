@@ -2,10 +2,12 @@
 {
   imports = [ inputs.devshell.flakeModule ];
   perSystem =
-    { config, pkgs, ... }:
-    let
-      rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
-    in
+    {
+      config,
+      pkgs,
+      rust-toolchain,
+      ...
+    }:
     {
       devshells.default = {
         packages = [
