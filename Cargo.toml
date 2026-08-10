@@ -15,3 +15,11 @@ unused_must_use = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
+
+# CI compiles one profile and this is it, so the binary the tests ran against is the
+# binary that ships. Release defaults both of these off, which would leave nothing in
+# CI able to catch an arithmetic overflow; on an I/O-bound webhook the cost of keeping
+# them on does not show up, and a wrapped TTL becomes a panic rather than a wrong record.
+[profile.release]
+debug-assertions = true
+overflow-checks = true
