@@ -61,8 +61,15 @@ check-version version:
         echo "tag {{ version }} does not match crate version $crate" >&2; exit 1; \
     fi
 
-# Run CI checks locally
-ci: fmt-check lint test doc readme-check build
+# Run CI checks the way CI runs them. The lint, test, doc and build recipes above stay the
+# fast dev-profile loop; this one goes through the flake, which compiles release once and
+# shares it across clippy, the tests and the docs.
+#
+# Packaging refuses a dirty tree, so this wants a committed one, the same way CI gets it.
+ci: fmt-check readme-check
+    cargo metadata --locked --format-version 1 > /dev/null
+    cargo package --locked --workspace
+    nix flake check --print-build-logs
     @echo "All CI checks passed!"
 
 # Clean build artifacts

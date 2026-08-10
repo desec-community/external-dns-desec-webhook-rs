@@ -16,11 +16,16 @@ runs:
     - name: Restore the Nix store
       uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2, 2026-01-30
       with:
-        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+        # Cargo.lock and the toolchain file are in the key because the store now holds the
+        # compiled dependency tree, not just the toolchain and the dev tools. Those two are
+        # exactly what crane's dependency derivation is built from, so a change to either
+        # should land under a new key rather than restore artefacts nothing will hit.
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.nix', '**/flake.lock', 'Cargo.lock', 'rust-toolchain.toml') }}
         restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-        # Deliberately not keyed on Cargo.lock: the store holds the toolchain and the dev
-        # tools, which a dependency bump does not change. Cargo's own artefacts are not here.
-        gc-max-store-size-linux: 2G
+        # Up from 2G to cover the compiled dependency tree, which measures ~0.5G on top of
+        # the toolchain and the dev tools. Not higher: the repository-wide cache limit is
+        # 10G and amd64 and arm64 each keep their own, so headroom here is quota there.
+        gc-max-store-size-linux: 4G
         purge: true
         purge-prefixes: nix-${{ runner.os }}-${{ runner.arch }}-
         purge-created: 0

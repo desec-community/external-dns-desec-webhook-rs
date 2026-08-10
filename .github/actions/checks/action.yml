@@ -3,28 +3,17 @@ description: >
   Every check the project has, one named step each so a red run says which one failed without
   anyone opening the log.
 
+  Clippy, the tests, the docs and the build itself are flake checks rather than steps here.
+  That is what lets them share one compiled dependency tree: the store cache restores it, and
+  each derivation then only compiles this crate. Running them through `nix develop` instead
+  would rebuild the world into a target/ that no cache carries between runs.
+
 runs:
   using: composite
   steps:
     - name: Formatting
       shell: bash
       run: nix develop -c just fmt-check
-
-    - name: Clippy
-      shell: bash
-      run: nix develop -c just lint
-
-    - name: Tests
-      shell: bash
-      run: nix develop -c just test
-
-    - name: Build
-      shell: bash
-      run: nix develop -c just build
-
-    - name: Docs
-      shell: bash
-      run: nix develop -c just doc
 
     - name: README is generated from lib.rs
       shell: bash
@@ -40,10 +29,11 @@ runs:
       # would make `cargo publish` fail at the worst possible moment.
       run: nix develop -c cargo package --locked --workspace
 
-    # For a binary the image is the artefact, so a green cargo build says nothing about
-    # whether what ships actually starts. `checks.image-starts` runs the binary with
-    # --check-config, which is the only check that catches an image without a CA bundle:
-    # rustls loads the trust store when the client is constructed, not at first request.
+    # Clippy, tests, docs, the binary, and image-starts. For a binary the image is the
+    # artefact, so a green build says nothing about whether what ships actually starts:
+    # image-starts runs it with --check-config, which is the only check that catches an
+    # image without a CA bundle, because rustls loads the trust store when the client is
+    # constructed rather than at first request.
     - name: Nix flake check
       shell: bash
       run: nix flake check --print-build-logs
