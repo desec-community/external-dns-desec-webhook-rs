@@ -36,7 +36,7 @@ chrono = { version = "0.4.45", default-features = false, features = [
   "std",
 ] }
 clap = { version = "4.6.5", features = ["derive", "env"] }
-desec = { version = "0.0.1", default-features = false, features = [
+desec = { version = "0.0.2", default-features = false, features = [
   "rustls-tls",
 ] }
 futures-util = { version = "0.3.33", default-features = false, features = [
@@ -60,6 +60,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+desec = { version = "0.0.2", default-features = false, features = [
+  "probes",
+  "rustls-tls",
+] }
 proptest = "1.9.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 tokio = { version = "1.53.1", features = ["test-util"] }
