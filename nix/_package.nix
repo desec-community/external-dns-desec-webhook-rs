@@ -12,7 +12,10 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "external-dns-desec-webhook";
-  version = "0.0.1";
+
+  # From the manifest, so a release bump has one place to happen. A second copy here would
+  # be one the pre-push tag check cannot see, and it names the store path of what ships.
+  version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
   # reqwest's rustls backend loads the system trust store when a client is constructed,
   # not when a request is made, so every test that builds a Client fails in the sandbox
