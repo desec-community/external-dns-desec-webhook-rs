@@ -29,6 +29,40 @@
       mdformat = config.treefmt.settings.formatter.mdformat.command;
 
       readme = "${cargo-readme} ${readmeArgs} | ${mdformat} -";
+
+      # Reads git's pre-push stdin, one `<local ref> <local sha> <remote ref> <remote sha>`
+      # line per ref. The version has to come from the tagged commit rather than from the
+      # working tree, which is why `just check-version` cannot serve here: a tag can be
+      # pushed from any checkout, including one several commits further along.
+      #
+      # Catching it at push time is the point. The release workflow runs the same check, but
+      # by then the tag exists on the remote, and a tag that has already been fetched is
+      # awkward to move.
+      check-tag-version = pkgs.writeShellApplication {
+        name = "check-tag-version";
+        runtimeInputs = [
+          pkgs.git
+          pkgs.gnused
+        ];
+        text = ''
+          status=0
+          while read -r local_ref local_sha _remote_ref _remote_sha; do
+            case "$local_ref" in refs/tags/v*) ;; *) continue ;; esac
+            # An all-zero sha is a deletion: there is no commit to read a version from.
+            case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+
+            tag="''${local_ref#refs/tags/}"
+            crate="$(git show "$local_sha:Cargo.toml" \
+              | sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version = "\(.*\)"/\1/p }')"
+
+            if [ "$tag" != "v$crate" ]; then
+              echo "$tag names v$crate at ''${local_sha:0:12}" >&2
+              status=1
+            fi
+          done
+          exit "$status"
+        '';
+      };
     in
     {
       hk-nix.settings.hooks = {
@@ -55,6 +89,9 @@
           };
           lock-check = {
             check = "cargo metadata --locked --format-version 1 > /dev/null";
+          };
+          tag-version = {
+            check = ''printf '%s\n' "{{hook_stdin}}" | ${lib.getExe check-tag-version}'';
           };
           # The golden corpus is captured from a real external-dns, so a hand-edit can
           # silently stop being valid JSON. Parsing it needs no network and no build.
