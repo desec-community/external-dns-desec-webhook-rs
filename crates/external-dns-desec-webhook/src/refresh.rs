@@ -378,7 +378,7 @@ fn failure_kind(error: &desec::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(server: &MockServer) -> desec::Client {
@@ -391,10 +391,24 @@ mod tests {
     }
 
     fn refresher(server: &MockServer, store: SnapshotStore, include: &[&str]) -> Refresher {
+        refresher_with(
+            server,
+            store,
+            include,
+            Arc::new(Metrics::new(false, "test")),
+        )
+    }
+
+    fn refresher_with(
+        server: &MockServer,
+        store: SnapshotStore,
+        include: &[&str],
+        metrics: Arc<Metrics>,
+    ) -> Refresher {
         Refresher::new(
             client(server),
             store,
-            Arc::new(Metrics::new(false, "test")),
+            metrics,
             include.iter().map(|z| (*z).to_owned()).collect(),
             Vec::new(),
             Duration::from_secs(180),
@@ -432,6 +446,73 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(domains))
             .mount(server)
             .await;
+    }
+
+    /// deSEC pages these collections at 500 items and `all()` walks the pages, so a zone
+    /// larger than one page is several authenticated requests. They come out of the same
+    /// 2000-a-day account budget as the first one, and counting the walk once leaves the
+    /// budget understated on exactly the accounts closest to exhausting it.
+    ///
+    /// Red: the count is per call site, and a call site sees one `all()` however many pages
+    /// it walked. Counting pages from here means reimplementing the page walk; the fix
+    /// belongs in the client, which is the only layer that knows a request went out.
+    #[ignore = "known under-count: pagination walks N pages and counts 1"]
+    #[tokio::test]
+    async fn every_page_of_a_zone_read_is_counted_not_just_the_first() {
+        let server = MockServer::start().await;
+        mock_zones(
+            &server,
+            vec![domain_json("example.com", "2026-01-01T00:00:00Z")],
+        )
+        .await;
+        // `cursor` is always sent, empty for the first page, so the two pages are told
+        // apart by its value rather than by the order the mocks were mounted.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/domains/example.com/rrsets/"))
+            .and(query_param("cursor", ""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Link",
+                        "<https://desec.io/api/v1/domains/example.com/rrsets/?cursor=page2>; \
+                         rel=\"next\"",
+                    )
+                    .set_body_json(vec![rrset_json("example.com", "www", "A")]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/domains/example.com/rrsets/"))
+            .and(query_param("cursor", "page2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![rrset_json(
+                "example.com",
+                "mail",
+                "A",
+            )]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let metrics = Arc::new(Metrics::new(false, "test"));
+        let store = SnapshotStore::new();
+        let update = refresher_with(
+            &server,
+            store.clone(),
+            &["example.com"],
+            Arc::clone(&metrics),
+        )
+        .tick()
+        .await;
+
+        assert_eq!(update.listed[0].rrsets.len(), 2, "both pages were read");
+        server.verify().await;
+
+        let rendered = metrics.encode(&store, false).expect("encodes");
+        assert!(
+            rendered.contains(r#"webhook_desec_requests_total{op="list_rrsets",outcome="ok"} 2"#),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

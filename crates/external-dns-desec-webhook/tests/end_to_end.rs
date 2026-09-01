@@ -298,6 +298,39 @@ async fn re_applying_the_same_change_makes_no_second_request() {
     );
 }
 
+/// The invariant behind the counter, stated once rather than per call site: what deSEC was
+/// asked for is what the metric says. Counting is per call site today, which is the shape that
+/// let the write path go uncounted, so this asserts the total against the requests the
+/// stand-in actually served rather than against any one operation.
+#[tokio::test]
+async fn the_request_counter_agrees_with_what_desec_was_asked_for() {
+    let harness = Harness::start(&["example.com"]).await;
+    let change = json!({"create": [endpoint("www.example.com", "A", ["192.0.2.1"])]});
+
+    // Something of each kind: a write, a write that suppresses, a refresh that re-reads
+    // because the zone moved, and a retype that batches two RRsets into one request.
+    apply(&harness, change.clone()).await;
+    apply(&harness, change).await;
+    harness.reload().await;
+    apply(
+        &harness,
+        json!({
+            "create": [endpoint("www.example.com", "CNAME", ["target.example.org"])],
+            "delete": [endpoint("www.example.com", "A", ["192.0.2.1"])],
+        }),
+    )
+    .await;
+    harness.reload().await;
+
+    let counted = counted_requests(&harness.scrape());
+    assert!(counted > 0, "the sequence has to have spent something");
+    assert_eq!(
+        counted,
+        harness.requests_served().await,
+        "every authenticated request counts against the same 2000-a-day account limit"
+    );
+}
+
 /// The 2000-a-day account limit counts every authenticated request, and a bulk PATCH is one.
 /// Counting only the reads leaves the metric understating the budget precisely when a
 /// reconcile is spending it.
@@ -453,6 +486,16 @@ async fn an_unroutable_path_does_not_panic() {
 }
 
 // -- helpers --------------------------------------------------------------------------------
+
+/// `desec_requests_total` summed over every op and outcome.
+fn counted_requests(scrape: &str) -> usize {
+    scrape
+        .lines()
+        .filter(|line| line.starts_with("webhook_desec_requests_total{"))
+        .filter_map(|line| line.rsplit(' ').next())
+        .filter_map(|count| count.parse::<usize>().ok())
+        .sum()
+}
 
 fn endpoint(dns_name: &str, record_type: &str, targets: [&str; 1]) -> serde_json::Value {
     json!({

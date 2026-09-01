@@ -340,7 +340,7 @@ pub struct Harness {
     pub store: SnapshotStore,
     refresher: Refresher,
     metrics: Arc<Metrics>,
-    _server: MockServer,
+    server: MockServer,
 }
 
 impl Harness {
@@ -396,10 +396,22 @@ impl Harness {
             store,
             refresher,
             metrics,
-            _server: server,
+            server,
         };
         harness.reload().await;
         harness
+    }
+
+    /// Every HTTP request the deSEC stand-in actually served.
+    ///
+    /// It serves nothing else, and the webhook's own endpoints are on a different listener,
+    /// so this is the whole bill: what the account would have paid deSEC.
+    pub async fn requests_served(&self) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .expect("the mock server records requests")
+            .len()
     }
 
     /// What `/metrics` would render, from the same registry the router writes into.
