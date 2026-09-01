@@ -25,7 +25,7 @@ use crate::adjust;
 use crate::apply::Applier;
 use crate::convert::{endpoint_from_parts, is_provider_managed};
 use crate::error::WebhookError;
-use crate::metrics::{EndpointLabel, Metrics, ReasonLabel};
+use crate::metrics::{EndpointLabel, Metrics, ReasonLabel, op};
 use crate::store::SnapshotStore;
 use crate::wire::{Changes, DomainFilter, Endpoint, MEDIA_TYPE, WebhookJson};
 
@@ -176,6 +176,11 @@ async fn apply_changes(
     let outcome = state.applier.apply(&changes).await;
 
     state.metrics.record_suppressed(&outcome.report.suppressed);
+    // Against the same account-wide budget the refresher's reads come out of, so counted in
+    // the same place: 2000 authenticated requests a day covers both.
+    for result in &outcome.report.request_outcomes {
+        state.metrics.record_desec_request(op::WRITE, result);
+    }
     for (zone, rrsets) in &outcome.report.written {
         state.metrics.record_write(zone, "ok", *rrsets);
     }

@@ -129,7 +129,9 @@
 //! `/metrics` on port 8080 is where the interesting answers are: a rising
 //! `changes_suppressed_total{reason="identical"}` on an idle cluster means external-dns
 //! is still planning writes that we are declining to make, and
-//! `desec_requests_total{status="429"}` means something else is sharing the account.
+//! `desec_requests_total{outcome="throttled"}` means something else is sharing the account.
+//! That counter covers reads and writes alike, split by `op`, because the 2000-a-day account
+//! limit does not distinguish them either.
 //!
 //! # Migrating from the Go provider
 //!

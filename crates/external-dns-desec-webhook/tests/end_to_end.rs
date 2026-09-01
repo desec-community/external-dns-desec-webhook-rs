@@ -298,6 +298,30 @@ async fn re_applying_the_same_change_makes_no_second_request() {
     );
 }
 
+/// The 2000-a-day account limit counts every authenticated request, and a bulk PATCH is one.
+/// Counting only the reads leaves the metric understating the budget precisely when a
+/// reconcile is spending it.
+#[tokio::test]
+async fn a_write_is_counted_against_the_same_request_budget_as_a_read() {
+    let harness = Harness::start(&["example.com"]).await;
+
+    assert_eq!(
+        apply(
+            &harness,
+            json!({"create": [endpoint("www.example.com", "A", ["192.0.2.1"])]}),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(harness.mock.mutations(), 1, "the write did reach deSEC");
+
+    let scrape = harness.scrape();
+    assert!(
+        scrape.contains(r#"webhook_desec_requests_total{op="write",outcome="ok"} 1"#),
+        "{scrape}"
+    );
+}
+
 /// TTL is clamped against the zone's own minimum, and an ownership record arrives with none at
 /// all: the TXT registry builds them with `endpoint.NewEndpoint` — TTL 0 — inside ApplyChanges,
 /// after `/adjustendpoints` has already run.

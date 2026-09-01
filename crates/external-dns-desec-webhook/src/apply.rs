@@ -139,6 +139,10 @@ pub struct ApplyReport {
     /// Zones left alone because deSEC refused them recently, and how long is left. No
     /// request was made for any of these.
     pub cooling_down: Vec<(String, Duration)>,
+    /// One entry per write we asked the deSEC client for, already classified as
+    /// `desec_requests_total` labels it. Writes spend the same account-wide budget as the
+    /// refresher's reads, so they have to be counted in the same place.
+    pub request_outcomes: Vec<&'static str>,
     /// RRsets deSEC rewrote on the way in. Empty is the expected state.
     pub normalized: Vec<Normalized>,
     pub zones_failed: usize,
@@ -161,9 +165,17 @@ struct ZoneWrite {
     normalized: Vec<Normalized>,
 }
 
+/// What one zone's write cost and how it failed.
+#[derive(Debug)]
+struct ZoneFailure {
+    reported: WebhookError,
+    /// How to count the request, or `None` for a zone we never asked about.
+    outcome: Option<&'static str>,
+}
+
 /// Per-zone outcomes, collected by the tasks themselves so a fired deadline cannot discard
 /// the knowledge of which zones already succeeded.
-type ZoneResults = Arc<Mutex<Vec<(String, Result<ZoneWrite, WebhookError>)>>>;
+type ZoneResults = Arc<Mutex<Vec<(String, Result<ZoneWrite, ZoneFailure>)>>>;
 
 /// The outcome of an apply, carrying both what to report to external-dns and what to
 /// record as metrics — the two are needed on both the success and failure paths.
@@ -280,7 +292,13 @@ impl Applier {
                         ),
                         *wait,
                     );
-                    (zone.clone(), Err(reported))
+                    (
+                        zone.clone(),
+                        Err(ZoneFailure {
+                            reported,
+                            outcome: None,
+                        }),
+                    )
                 })
                 .collect(),
         ));
@@ -301,11 +319,13 @@ impl Applier {
         for (zone, outcome) in finished {
             match outcome {
                 Ok(write) => {
+                    report.request_outcomes.push(crate::metrics::outcome::OK);
                     report.written.push((zone, write.rrsets));
                     report.normalized.extend(write.normalized);
                 }
-                Err(reported) => {
+                Err(ZoneFailure { reported, outcome }) => {
                     report.zones_failed += 1;
+                    report.request_outcomes.extend(outcome);
                     // Prefer a throttle over a rejection when reporting: it tells
                     // external-dns how long to wait, which is more actionable than which
                     // record deSEC disliked.
@@ -386,7 +406,7 @@ async fn write_zone(
     store: &SnapshotStore,
     cooldown: &Cooldown,
     plan: &ZonePlan,
-) -> Result<ZoneWrite, WebhookError> {
+) -> Result<ZoneWrite, ZoneFailure> {
     let rrsets = plan.patches.len();
     tracing::debug!(zone = %plan.zone, rrsets, "writing");
 
@@ -438,7 +458,10 @@ async fn write_zone(
                 patches = %describe(&plan.patches),
                 "write failed"
             );
-            Err(reported)
+            Err(ZoneFailure {
+                reported,
+                outcome: Some(crate::metrics::outcome_of(&error)),
+            })
         }
     }
 }
@@ -681,6 +704,11 @@ mod tests {
                  for the whole round trip, once"
             );
             assert!(!outcome.report.timed_out);
+            assert_eq!(
+                outcome.report.request_outcomes,
+                ["throttled"],
+                "a refused write is still a request the account paid for"
+            );
         }
     }
 
@@ -729,6 +757,10 @@ mod tests {
         );
         assert_eq!(second.report.cooling_down.len(), 1);
         assert_eq!(second.report.requests(), 0);
+        assert!(
+            second.report.request_outcomes.is_empty(),
+            "the whole point of the cooldown: nothing was asked, so nothing is counted"
+        );
     }
 
     /// The counterpart: the cooldown lets go on its own, without anything clearing it.

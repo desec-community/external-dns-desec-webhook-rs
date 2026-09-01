@@ -339,6 +339,7 @@ pub struct Harness {
     pub mock: DesecMock,
     pub store: SnapshotStore,
     refresher: Refresher,
+    metrics: Arc<Metrics>,
     _server: MockServer,
 }
 
@@ -377,7 +378,7 @@ impl Harness {
                 false,
                 Duration::from_secs(3600),
             )),
-            metrics,
+            metrics: Arc::clone(&metrics),
             filter: DomainFilter::include(owned),
             allow_empty_zone_set: false,
             max_body_bytes: 32 * 1024 * 1024,
@@ -394,10 +395,18 @@ impl Harness {
             mock,
             store,
             refresher,
+            metrics,
             _server: server,
         };
         harness.reload().await;
         harness
+    }
+
+    /// What `/metrics` would render, from the same registry the router writes into.
+    pub fn scrape(&self) -> String {
+        self.metrics
+            .encode(&self.store, true)
+            .expect("the registry encodes")
     }
 
     /// One refresh pass, as the background loop would eventually do.

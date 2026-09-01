@@ -66,6 +66,16 @@ pub mod outcome {
     pub const ERROR: &str = "error";
 }
 
+/// Classify a deSEC failure the same way the HTTP layer does, so the two agree.
+pub fn outcome_of(error: &desec::Error) -> &'static str {
+    match error {
+        desec::Error::RateLimitWouldBlock { .. } => outcome::WOULD_BLOCK,
+        desec::Error::RateLimited { .. } => outcome::THROTTLED,
+        _ if error.is_unauthorized() || error.is_forbidden() => outcome::UNAUTHORIZED,
+        _ => outcome::ERROR,
+    }
+}
+
 /// The record type of an RRset deSEC rewrote on storage.
 ///
 /// An owned `String` rather than the `&'static str` the other label sets use, because
@@ -316,25 +326,22 @@ impl Metrics {
         );
     }
 
-    /// Classify a deSEC failure the same way the HTTP layer does, so the two agree.
     pub fn record_desec_error(&self, op: &'static str, error: &desec::Error) {
-        let outcome = match error {
-            desec::Error::RateLimitWouldBlock { .. } => outcome::WOULD_BLOCK,
-            desec::Error::RateLimited { .. } => outcome::THROTTLED,
-            _ if error.is_unauthorized() || error.is_forbidden() => outcome::UNAUTHORIZED,
-            _ => outcome::ERROR,
-        };
-        self.desec_requests
-            .get_or_create(&RequestLabels { op, outcome })
-            .inc();
+        self.record_desec_request(op, outcome_of(error));
     }
 
     pub fn record_desec_ok(&self, op: &'static str) {
+        self.record_desec_request(op, outcome::OK);
+    }
+
+    /// Count a call whose outcome has already been classified.
+    ///
+    /// The write path needs this: the `desec::Error` is turned into a `WebhookError` inside
+    /// the task that made the request, so by the time the apply report reaches the handler
+    /// there is nothing left to classify.
+    pub fn record_desec_request(&self, op: &'static str, outcome: &'static str) {
         self.desec_requests
-            .get_or_create(&RequestLabels {
-                op,
-                outcome: outcome::OK,
-            })
+            .get_or_create(&RequestLabels { op, outcome })
             .inc();
     }
 
