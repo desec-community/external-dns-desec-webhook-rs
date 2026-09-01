@@ -10,15 +10,29 @@ provider:
   webhook:
     image:
       repository: ghcr.io/desec-community/external-dns-desec-webhook-rs
-      tag: "<version goes here>"
+      tag: v0.1.1
     env:
       - name: DESEC_TOKEN_FILE
         value: /etc/desec/token
       - name: DESEC_DOMAIN_FILTER
         value: example.com
+    extraVolumeMounts:
+      - name: desec-credentials
+        mountPath: /etc/desec
+        readOnly: true
+extraVolumes:
+  - name: desec-credentials
+    secret:
+      secretName: desec-credentials
+      items:
+        - key: token
+          path: token
 extraArgs:
   - --txt-prefix=externaldns-%{record_type}.
 ```
+
+The provider endpoints listen on `127.0.0.1:8888`; `/healthz`, `/readyz` and `/metrics`
+listen on `0.0.0.0:8080`, where the external-dns chart's default probes already point.
 
 ## deSEC rate limits, external-dns request budget
 
@@ -114,11 +128,25 @@ $ curl -H 'Accept: application/external.dns.webhook+json;version=1' \
 is still planning writes that we are declining to make, and
 `desec_requests_total{status="429"}` means something else is sharing the account.
 
-## Further reading
+## Migrating from the Go provider
 
-`docs/protocol.md` records the webhook wire format and where in external-dns each
-detail was verified, `docs/rate-limits.md` works through the request budget, and
-`docs/deployment.md` has the full manifests.
+Names changed, and two of the old ones did not work as documented anyway: its README said
+`WEBHOOK_ADDRESS` and `WEBHOOK_PORT` while its `envconfig` read `WEBHOOK_WEBHOOKADDRESS`
+and `WEBHOOK_WEBHOOKPORT`.
+
+| Old | New | Note |
+| --- | --- | --- |
+| `WEBHOOK_APITOKEN` | `DESEC_TOKEN`, or `DESEC_TOKEN_FILE` | |
+| `WEBHOOK_DOMAINFILTERS` | `DESEC_DOMAIN_FILTER` | still comma-separated, still required |
+| `WEBHOOK_DEFAULTTTL` | *(gone)* | the zone's own `minimum_ttl` is read from the API |
+| `WEBHOOK_WEBHOOKADDRESS` + `WEBHOOK_WEBHOOKPORT` | `WEBHOOK_LISTEN` | one `host:port` |
+| `WEBHOOK_HEALTHADDRESS` + `WEBHOOK_HEALTHPORT` | `WEBHOOK_ADMIN_LISTEN` | one `host:port` |
+| `WEBHOOK_DRYRUN` | `WEBHOOK_DRY_RUN` | |
+| `WEBHOOK_LOGLEVEL` | `RUST_LOG` | e.g. `external_dns_desec_webhook=debug` |
+
+You can also drop external-dns's `--min-ttl=1h`, which worked around the old provider not
+normalizing TTLs where external-dns could see it; `/adjustendpoints` now clamps against
+each zone's real minimum.
 
 ## License
 

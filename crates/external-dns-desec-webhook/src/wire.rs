@@ -2,8 +2,7 @@
 //!
 //! Every type here mirrors a Go type in external-dns, and the mapping was established by
 //! reading `endpoint/endpoint.go`, `endpoint/domain_filter.go`, `plan/plan.go` and
-//! `provider/webhook/webhook.go` at v0.21.0. `docs/protocol.md` records where each fact
-//! came from; the doctests below are what keep them true.
+//! `provider/webhook/webhook.go` at v0.21.0; the doctests below are what keep them true.
 //!
 //! Nothing in this module knows about deSEC, and nothing in it is async.
 

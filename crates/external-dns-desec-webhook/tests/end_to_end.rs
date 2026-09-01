@@ -1,7 +1,6 @@
 //! The webhook driven over a real socket, against a stateful stand-in for deSEC.
 //!
-//! Every test here is named for the protocol fact or the historical bug it pins. Where a fact
-//! came from reading external-dns's source, `docs/protocol.md` records which file.
+//! Every test here is named for the protocol fact or the historical bug it pins.
 
 #![allow(clippy::unwrap_used)]
 

@@ -173,7 +173,7 @@ pub const WEBHOOK_PROBES: &[WebhookProbe] = &[
     },
     // The one that vindicates emitting a single character-string and letting deSEC split:
     // it comes back as two, and `txt_unquote` rejoins them, so external-dns sees the value
-    // it asked for. `docs/testing.md` used to call this the open question of the design.
+    // it asked for.
     WebhookProbe {
         id: "txt-long",
         subname: "txt-long",
