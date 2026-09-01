@@ -1,5 +1,6 @@
-# Git hooks via hk-nix. The generated hk.pkl is symlinked into the repo root by
-# the devshell startup hook (see devshell.nix); hk.pkl is gitignored.
+# Git hooks via hk-nix. The generated hk.pkl stays in the store; the devshell startup hook
+# (see devshell.nix) installs hooks that reach it through an HK_FILE wrapper, so nothing is
+# written into the repo. The gitignore entry covers checkouts left over from when it was.
 { inputs, ... }:
 {
   imports = [ inputs.hk-nix.flakeModules.default ];
@@ -52,11 +53,14 @@
             case "$local_sha" in *[!0]*) ;; *) continue ;; esac
 
             tag="''${local_ref#refs/tags/}"
-            crate="$(git show "$local_sha:Cargo.toml" \
+            # An annotated tag pushes the sha of the tag object, not of the commit it points
+            # at. Peeled here so the sha in the message below is one that can be checked out.
+            commit="$(git rev-parse "$local_sha^{commit}")"
+            crate="$(git show "$commit:Cargo.toml" \
               | sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version = "\(.*\)"/\1/p }')"
 
             if [ "$tag" != "v$crate" ]; then
-              echo "$tag names v$crate at ''${local_sha:0:12}" >&2
+              echo "$tag names v$crate at ''${commit:0:12}" >&2
               status=1
             fi
           done
