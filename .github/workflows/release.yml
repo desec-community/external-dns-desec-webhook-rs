@@ -1,15 +1,8 @@
 # Tag-triggered release.
 #
-# Two properties the Go provider's release workflow did not have, both of which cost nothing:
+# The crates.io publish is last because it is the only irreversible step.
 #
-#   1. Nothing reaches a registry before `checks` passes. There, the image build started
-#      immediately, so a tag on a broken tree published a broken image.
-#   2. `contents: write` lives in a different job from `packages: write` and `id-token: write`.
-#      There, one job held all of them, so the job that could sign artefacts could also rewrite
-#      the repository.
-#
-# The crates.io publish is last on purpose: it is the only irreversible step. A bad image can be
-# retagged; a published version cannot be unpublished.
+# A bad image can be retagged; a published version cannot be unpublished.
 name: release
 
 on:
@@ -152,10 +145,28 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, 2026-07-17
+        with:
+          # git-cliff walks from the previous tag to this one, so a shallow clone sees nothing.
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-nix
+
+      # Use git-cliff instead of GitHub's release generator
+      - name: Render the changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+          {
+            echo 'notes<<CLIFF_EOF'
+            nix develop -c git-cliff --latest
+            echo 'CLIFF_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2, 2026-07-13
         with:
-          generate_release_notes: true
           body: |
             ```
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
@@ -169,8 +180,9 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com
             ```
 
+            ${{ steps.changelog.outputs.notes }}
+
   crates-io:
-    # Last, because it is the only step that cannot be undone.
     needs: [publish, github-release]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

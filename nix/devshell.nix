@@ -19,6 +19,7 @@
           pkgs.just
           pkgs.cargo-readme
           pkgs.cmake
+          pkgs.git-cliff
           pkgs.skopeo
           pkgs.syft
         ];

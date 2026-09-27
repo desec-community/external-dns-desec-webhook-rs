@@ -1,0 +1,47 @@
+# git-cliff turns the conventional-commit history into GitHub release notes.
+#
+# There is no CHANGELOG.md: the GitHub Release body is the only consumer, so the template omits a
+# version heading (the Release title already carries it) and ends with the compare link.
+
+[changelog]
+
+body = """
+{%- set repo = "https://github.com/desec-community/external-dns-desec-webhook-rs" -%}
+{%- for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+{{ commit.message }} \
+([{{ commit.id | truncate(length=7, end="") }}]({{ repo }}/commit/{{ commit.id }}))
+{%- endfor %}
+{% endfor -%}
+{%- if previous.version and version %}
+**Full Changelog**: {{ repo }}/compare/{{ previous.version }}...{{ version }}
+{%- endif %}
+"""
+
+trim = true
+
+[git]
+conventional_commits = true
+# A subject that does not parse is a hook failure, not something to quietly drop from the notes.
+filter_unconventional = false
+filter_commits = true
+protect_breaking_commits = true
+sort_commits = "oldest"
+tag_pattern = "v[0-9]*"
+
+commit_parsers = [
+  { message = "^Merge", skip = true },
+  # Release mechanics. The tag says the version; repeating it in its own notes says nothing.
+  { message = "^chore\\(cargo\\): bump the workspace", skip = true },
+
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^(chore|ci|build)", group = "<!-- 6 -->Build and CI" },
+  { message = ".*", group = "<!-- 7 -->Other" },
+]

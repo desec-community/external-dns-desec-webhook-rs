@@ -54,6 +54,11 @@ readme:
 readme-check:
     cargo readme {{ readme_args }} | mdformat - | diff - README.md
 
+# Preview the release notes CI will attach to a tag. Defaults to the newest tag; pass
+# --unreleased to see what tagging HEAD would produce, or a range like v0.1.2..v0.1.3.
+changelog *args='--latest':
+    git cliff {{ args }} --output -
+
 # Assert the release tag names the version cargo would publish
 check-version version:
     @pkgid="$(cargo pkgid -p external-dns-desec-webhook)"; crate="v${pkgid##*#}"; \
