@@ -382,6 +382,35 @@ async fn an_ownership_record_arriving_without_a_ttl_is_stored_with_the_zone_mini
     );
 }
 
+/// The ownership payload as external-dns really sends it: its TXT registry serializes labels
+/// with `withQuotes` set, so the target arrives already in presentation form. Quoting it again
+/// wrapped it twice, and deSEC served a TXT value carrying two literal quote characters.
+#[tokio::test]
+async fn an_ownership_record_arriving_quoted_is_stored_with_one_layer_of_quotes() {
+    let harness = Harness::start(&["example.com"]).await;
+    let change = json!({"create": [{
+        "dnsName": "externaldns-a.www.example.com",
+        "recordType": "TXT",
+        "targets": [r#""heritage=external-dns,external-dns/owner=lab""#],
+    }]});
+
+    apply(&harness, change.clone()).await;
+
+    assert_eq!(
+        harness
+            .mock
+            .state("example.com")
+            .get("externaldns-a.www/TXT")
+            .expect("the ownership record was written"),
+        &vec![r#""heritage=external-dns,external-dns/owner=lab""#.to_owned()]
+    );
+
+    // And the one layer is what the next cycle compares against, so the record settles.
+    let after_first = harness.mock.mutations();
+    apply(&harness, change).await;
+    assert_eq!(harness.mock.mutations(), after_first, "no second write");
+}
+
 /// With the default `--txt-prefix`, the companion record for a zone apex is named in the
 /// *parent* zone. deSEC scopes every call to a zone we own, so it cannot be created. Skipping
 /// it keeps the rest of the cycle applying instead of failing the batch.

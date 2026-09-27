@@ -134,6 +134,32 @@ pub fn txt_unquote(presentation: &str) -> String {
     }
 }
 
+/// The heritage marker that opens every value external-dns's TXT registry writes.
+const OWNERSHIP_PREFIX: &str = "heritage=external-dns";
+
+/// The plain value behind a target external-dns has already put in presentation form.
+///
+/// Ownership records are the one target that does not arrive as a plain value: the TXT
+/// registry builds them with `Labels.Serialize(withQuotes: true)`, so what reaches a
+/// provider is `"heritage=external-dns,..."` with the quotes part of the string. Quoting
+/// that again stores `"\"heritage=...\""`, and deSEC then serves a TXT value whose data
+/// carries two literal quote characters.
+///
+/// Nothing ever repaired it, because the round trip stays consistent with itself:
+/// [`txt_unquote`] takes exactly one layer back off, so external-dns compares equal and
+/// never asks for a rewrite. Only the zone is wrong, and only to whoever reads it.
+///
+/// Recognized by the heritage marker rather than by being quoted at all. Quotes around a
+/// target external-dns did not serialize are data, and unwrapping them would report back
+/// something other than what the source asked for — which is a write every cycle.
+fn strip_external_dns_quoting(target: &str) -> Option<&str> {
+    let inner = target.strip_prefix('"')?.strip_suffix('"')?;
+    // Serialize wraps and does nothing else, so a quote or a backslash left inside is
+    // not its doing, whatever the value starts with.
+    let unescaped = !inner.contains('"') && !inner.contains('\\');
+    (inner.starts_with(OWNERSHIP_PREFIX) && unescaped).then_some(inner)
+}
+
 /// external-dns's plain value to deSEC's TXT presentation form.
 ///
 /// One quoted chunk, however long the value. deSEC splits anything over 255 bytes itself,
@@ -257,7 +283,9 @@ pub fn records_for(record_type: &RecordType, targets: &[String]) -> Vec<String> 
         .iter()
         .map(|target| {
             if is_text_type(record_type) {
-                txt_quote(target)
+                // external-dns's own quoting comes off before deSEC's goes on, or the
+                // value reaches the zone wrapped twice.
+                txt_quote(strip_external_dns_quoting(target).unwrap_or(target))
             } else {
                 map_rdata_name(record_type, target, |name| {
                     let bare = canonical_name(name);
@@ -467,6 +495,28 @@ mod tests {
         assert_eq!(
             txt_unquote("heritage=external-dns"),
             "heritage=external-dns"
+        );
+    }
+
+    /// What external-dns actually sends. The registry serializes ownership values with
+    /// the quotes already on, so quoting again put `"\"heritage=...\""` in the zone.
+    #[test]
+    fn an_ownership_value_external_dns_quoted_is_not_quoted_a_second_time() {
+        let serialized = r#""heritage=external-dns,external-dns/owner=k8s,external-dns/resource=httproute/ns/name""#;
+
+        assert_eq!(
+            records_for(&RecordType::TXT, &[serialized.to_owned()]),
+            vec![serialized.to_owned()]
+        );
+    }
+
+    /// And quotes around anything else stay data: they are escaped and wrapped like any
+    /// other byte, because reporting back less than the source asked for is a write loop.
+    #[test]
+    fn quotes_around_a_value_of_no_heritage_are_content() {
+        assert_eq!(
+            records_for(&RecordType::TXT, &[r#""v=spf1 -all""#.to_owned()]),
+            vec![r#""\"v=spf1 -all\"""#.to_owned()]
         );
     }
 
